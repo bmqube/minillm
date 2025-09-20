@@ -12,3 +12,4 @@ readme = "README.md"
 exclude = ["target/", ".git/", ".gitignore"]
 
 [dependencies]
+tokenizers = { version = "0.22.1", features = ["http"] }

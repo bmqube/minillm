@@ -1,10 +1,18 @@
-use hf_hub::api::sync::Api;
+use dotenv::dotenv;
+use hf_hub::api::sync::ApiBuilder;
 use serde_json::Value;
+use std::env;
 use tokenizers::Tokenizer;
 
 fn main() {
-    let api = Api::new().unwrap();
-    let repo = api.model("Qwen/Qwen2.5-0.5B-Instruct".to_string());
+    dotenv().ok();
+
+    let api = ApiBuilder::new()
+        .with_token(Some(env::var("HF_TOKEN").unwrap()))
+        .build()
+        .unwrap();
+
+    let repo = api.model("google/gemma-3-270m".to_string());
 
     // Download model files
     let tokenizer_path = repo.get("tokenizer.json").unwrap();

@@ -1,0 +1,14 @@
+[package]
+name = "minillm"
+version = "0.1.0"
+edition = "2024"
+authors = ["BM Monjur Morshed"]
+description = "A mini inference engine for running language models"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bmqube/minillm"
+homepage = "https://github.com/bmqube/minillm"
+documentation = "https://docs.rs/minillm"
+readme = "README.md"
+exclude = ["target/", ".git/", ".gitignore"]
+
+[dependencies]

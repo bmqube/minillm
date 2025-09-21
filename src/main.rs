@@ -5,7 +5,11 @@ use std::env;
 use tokenizers::Tokenizer;
 
 mod config;
+mod model;
+mod tensor;
+
 use config::ModelConfig;
+use model::ModelWeights;
 
 fn main() {
     dotenv().ok();
@@ -44,4 +48,6 @@ fn main() {
     println!("Original text: {}", text);
     println!("Tokens: {:?}", encoded_prompt.get_tokens());
     println!("Token IDs: {:?}", token_ids);
+
+    let weights = ModelWeights::load_from_safetensors(&model_path).unwrap();
 }

@@ -11,7 +11,7 @@ impl ModelWeights {
     pub fn load_from_safetensors(
         path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        println!("Loading model weights from {:?}", path);
+        println!("Loading model weights...");
 
         let buffer = fs::read(path).unwrap();
         let safetensors = SafeTensors::deserialize(&buffer).unwrap();
@@ -22,6 +22,7 @@ impl ModelWeights {
 
         for name in safetensors.names() {
             let tensor_view = safetensors.tensor(name).unwrap();
+
             let raw_data = tensor_view.data();
             let data: Vec<f32> = raw_data
                 .chunks_exact(4)

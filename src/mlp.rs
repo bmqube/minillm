@@ -1,16 +1,24 @@
+//! Multi-Layer Perceptron (Feed-Forward Network) implementation
+
 use crate::tensor::Tensor;
 use crate::weights::ModelWeights;
 
+/// Multi-Layer Perceptron with GELU activation
+///
+/// Standard transformer feed-forward network with:
+/// 1. Linear projection to intermediate size
+/// 2. GELU activation
+/// 3. Linear projection back to hidden size
 pub struct MLP {
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
+    _hidden_size: usize,
+    _intermediate_size: usize,
 }
 
 impl MLP {
     pub fn new(hidden_size: usize, intermediate_size: usize) -> Self {
         Self {
-            hidden_size,
-            intermediate_size,
+            _hidden_size: hidden_size,
+            _intermediate_size: intermediate_size,
         }
     }
 

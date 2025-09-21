@@ -1,15 +1,37 @@
 [package]
 name = "minillm"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 authors = ["BM Monjur Morshed"]
-description = "A mini inference engine for running language models"
+description = "A mini inference engine for running transformer language models"
 license = "MIT"
 repository = "https://github.com/bmqube/minillm"
 homepage = "https://github.com/bmqube/minillm"
 documentation = "https://docs.rs/minillm"
 readme = "README.md"
+keywords = ["llm", "transformer", "inference", "gpt", "ai"]
+categories = ["algorithms", "science"]
 exclude = ["target/", ".git/", ".gitignore"]
+
+[lib]
+name = "minillm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "minillm"
+path = "src/main.rs"
+
+[[example]]
+name = "basic_generation"
+path = "examples/basic_generation.rs"
+
+[[example]]
+name = "interactive_chat"
+path = "examples/interactive_chat.rs"
+
+[[example]]
+name = "tokenization"
+path = "examples/tokenization.rs"
 
 [dependencies]
 dotenv = "0.15.0"

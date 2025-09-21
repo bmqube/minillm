@@ -1,5 +1,14 @@
+//! Tensor operations for neural network computations
+//!
+//! This module provides a lightweight tensor implementation built on top of ndarray
+//! that supports the essential operations needed for transformer inference:
+//! matrix multiplication, element-wise operations, normalization, and activations.
+
 use ndarray::{ArrayD, Axis};
 
+/// A dynamic tensor that can handle 1D to 4D arrays
+///
+/// Built on top of ndarray's ArrayD for flexible dimensionality
 #[allow(dead_code)]
 pub struct Tensor {
     pub data: ArrayD<f32>,
@@ -7,13 +16,22 @@ pub struct Tensor {
 
 #[allow(dead_code)]
 impl Tensor {
+    /// Create a tensor from shape and data vector
     pub fn from_shape(shape: &[usize], data: Vec<f32>) -> Self {
         Self {
             data: ArrayD::from_shape_vec(shape, data).unwrap(),
         }
     }
 
-    // Matrix multiplication - much cleaner with dynamic arrays!
+    /// Matrix multiplication supporting 1D-4D tensors
+    ///
+    /// Supports all common combinations:
+    /// - 1D × 1D: dot product
+    /// - 1D × 2D: vector-matrix multiplication  
+    /// - 2D × 1D: matrix-vector multiplication
+    /// - 2D × 2D: standard matrix multiplication
+    /// - 3D × 2D: batch matrix multiplication
+    /// - 4D × 2D: batch matrix multiplication with extra dimensions
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         let self_shape = self.data.shape();
         let other_shape = other.data.shape();

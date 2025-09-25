@@ -34,6 +34,7 @@ name = "tokenization"
 path = "examples/tokenization.rs"
 
 [dependencies]
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
 dotenv = "0.15.0"
 hf-hub = "0.4.3"
 ndarray = "0.16.1"

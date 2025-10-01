@@ -1,7 +1,7 @@
 use candle_core::{Device, Tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let device = Device::Cpu;
+    let device = Device::new_cuda(0)?;
     let (model, tokenizer) = minillm::loader::load("openai-community/gpt2", &device)?;
 
     let prompt = "The future of AI is";

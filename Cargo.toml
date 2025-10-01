@@ -35,9 +35,9 @@ path = "examples/tokenization.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.1" }
-candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.1" }
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
 clap = { version = "4.5.48", features = ["derive"] }
 dotenv = "0.15.0"
 hf-hub = "0.4.3"

@@ -46,15 +46,15 @@ impl MultiHeadAttention {
         ))?;
 
         // Split and transpose for attention
-        let q = qkv.i((.., .., 0, .., ..))?.transpose(1, 2)?; // [batch, heads, seq, head_dim]
-        let k = qkv.i((.., .., 1, .., ..))?.transpose(1, 2)?;
-        let v = qkv.i((.., .., 2, .., ..))?.transpose(1, 2)?;
+        let q = qkv.i((.., .., 0, .., ..))?.transpose(1, 2)?.contiguous()?; // [batch, heads, seq, head_dim]
+        let k = qkv.i((.., .., 1, .., ..))?.transpose(1, 2)?.contiguous()?;
+        let v = qkv.i((.., .., 2, .., ..))?.transpose(1, 2)?.contiguous()?;
 
         // Scaled dot-product attention
         let head_dim = self.n_embd / self.n_head;
         let scale = 1.0 / (head_dim as f64).sqrt();
 
-        let scores = q.matmul(&k.transpose(2, 3)?)?;
+        let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
         let mut scores = (scores * scale)?;
 
         // Apply causal mask

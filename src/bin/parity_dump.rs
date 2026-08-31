@@ -28,6 +28,20 @@ use candle_core::{IndexOp, Tensor};
 use minillm::generation::Generator;
 use minillm::model::GPT2Model;
 use minillm::{device, loader};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Entry {
+    prompt: String,
+    input_ids: Vec<u32>,
+    logits: Vec<f32>,
+}
+
+#[derive(Serialize)]
+struct Dump {
+    model: String,
+    entries: Vec<Entry>,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
@@ -76,37 +90,34 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
 
-    let mut json = String::from("{\n");
-    json.push_str(&format!("  \"model\": {model_ref:?},\n"));
-    json.push_str("  \"entries\": [\n");
-
-    for (i, prompt) in prompts.iter().enumerate() {
+    let mut entries = Vec::with_capacity(prompts.len());
+    for prompt in &prompts {
         let ids = tokenizer.encode(*prompt, true)?.get_ids().to_vec();
         let logits: Vec<f32> = if use_cache {
             last_logits_cached(&net, &ids, &dev)?
         } else {
             let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-            net.forward(&input)?
-                .i((0, ids.len() - 1))?
+            net.forward_last(&input)?
+                .i(0)?
                 .to_dtype(candle_core::DType::F32)?
                 .to_vec1::<f32>()?
         };
-
-        json.push_str("    {");
-        json.push_str(&format!("\"prompt\": {prompt:?}, "));
-        json.push_str(&format!("\"input_ids\": {ids:?}, "));
-        json.push_str(&format!("\"logits\": {logits:?}"));
-        json.push('}');
-        if i + 1 < prompts.len() {
-            json.push(',');
-        }
-        json.push('\n');
+        entries.push(Entry {
+            prompt: prompt.to_string(),
+            input_ids: ids,
+            logits,
+        });
     }
-    json.push_str("  ]\n}\n");
+
+    let dump = Dump {
+        model: model_ref,
+        entries,
+    };
 
     if let Some(parent) = Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    let json = serde_json::to_string_pretty(&dump)?;
     std::fs::File::create(&out_path)?.write_all(json.as_bytes())?;
     eprintln!("wrote {} prompts -> {out_path}", prompts.len());
     Ok(())

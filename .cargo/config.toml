@@ -1,0 +1,22 @@
+# Windows GNU (MSYS2 mingw-w64) build fix.
+#
+# rustup's bundled `self-contained` mingw libs are older than a current MSYS2
+# and ship a `libpthread.a` without `nanosleep64`. Native C deps compiled with
+# the MSYS2 gcc (aws-lc-sys, via hf-hub -> reqwest -> rustls) `#include` the
+# MSYS2 winpthreads headers, whose inline `nanosleep()` calls `nanosleep64()`,
+# then fail to link against the stale bundled lib.
+#
+# `link-self-contained=no` hands CRT + winpthreads resolution back to the MSYS2
+# `x86_64-w64-mingw32-gcc` driver, whose own `libwinpthread` exports
+# `nanosleep64`. Requires MSYS2 mingw-w64 (`pacman -S mingw-w64-x86_64-toolchain`)
+# on PATH, which the README already documents for this target.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=no"]
+
+# Windows MSVC: if a Unix-y `link` (Git/MSYS coreutils, Cygwin) is ahead of the
+# MSVC `link.exe` on PATH, linking dies with "extra operand ...". Either put the
+# MSVC toolchain's bin dir first on PATH, or uncomment this to link with the
+# bundled LLVM linker instead (needs the VS Build Tools "C++ build tools" +
+# Windows SDK for the CRT import libs):
+# [target.x86_64-pc-windows-msvc]
+# rustflags = ["-C", "linker=rust-lld", "-C", "linker-flavor=lld-link"]

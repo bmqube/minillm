@@ -18,7 +18,7 @@ base=https://huggingface.co/openai-community/gpt2/resolve/main
 for f in config.json tokenizer.json model.safetensors; do curl -sL -o "$f" "$base/$f"; done
 ```
 
-Both binaries also accept a Hub id (`openai-community/gpt2`) instead of the
+The binaries also accept a Hub id (`openai-community/gpt2`) instead of the
 directory, if you'd rather use the HF cache.
 
 ## 1. Throughput and size
@@ -31,8 +31,9 @@ cargo run --release --features cuda --bin bench -- benchmarks/gpt2 64 128   # GP
 Arguments: `MODEL PREFILL_TOKENS DECODE_STEPS`.
 
 Reports: load time, analytic parameter count, fp32 weight memory, prefill
-latency (tok/s), and greedy decode throughput (tok/s). It does **not** measure
-peak RAM itself — wrap the command:
+latency (tok/s), and greedy decode throughput **both without and with the KV
+cache**, plus the speedup. It does **not** measure peak RAM itself — wrap the
+command:
 
 | OS | command | field |
 |---|---|---|
@@ -40,10 +41,10 @@ peak RAM itself — wrap the command:
 | macOS | `/usr/bin/time -l <cmd>` | `maximum resident set size` |
 | Windows | `Get-Process bench \| Select-Object PeakWorkingSet64` | bytes |
 
-> There is no KV cache yet: every decode step recomputes the whole sequence, so
-> decode tok/s falls as the sequence grows. These numbers are the **baseline**
-> for the planned KV-cache work — keep the same `PREFILL`/`DECODE` args when
-> comparing before/after.
+> `decode(no cache)` recomputes the whole sequence every step (O(n²)), so its
+> tok/s falls as the sequence grows; `decode(KV cache)` prefills once then feeds
+> one token per step (O(n)). Keep the same `PREFILL`/`DECODE` args when comparing
+> across changes.
 
 ### Results — `openai-community/gpt2` (124M), fp32
 
@@ -54,14 +55,16 @@ candle 0.11.0 · `--release` · weights loaded from `benchmarks/gpt2/`.
 | metric | CPU | GPU |
 |---|---|---|
 | hardware | Ryzen 5 5600G, 28 GiB | not measured (no CUDA toolkit on this box) |
-| load time (local files) | 0.40 s | — |
+| load time (local files) | 0.4–0.6 s | — |
 | parameters | 124,439,808 | — |
 | fp32 weights | ~0.46 GiB | — |
-| prefill, 64 tok | 175 ms → **366 tok/s** (360–420 across runs) | — |
-| decode, 128 steps (seq 64→192) | **3.3 tok/s** (~38 s) — no KV cache | — |
+| prefill, 64 tok | **~366 tok/s** (360–420 across runs) | — |
+| decode, 128 steps (seq 64→192), no cache | **~3 tok/s** (~40 s) | — |
+| decode, 128 steps (seq 64→192), KV cache | **~43 tok/s** (~3 s) — **≈14× speedup** | — |
 | peak RSS | **977 MiB** | — |
 
 _GPU row: run the `--features cuda` command on a machine with the CUDA toolkit._
+_The KV-cache speedup grows with sequence length — see the sweep in §4._
 
 ## 2. Output parity vs HuggingFace Transformers
 
@@ -71,15 +74,18 @@ fp32 rounding.
 ```bash
 python -m pip install numpy torch transformers        # once
 
-cargo run --release --bin parity_dump                 # -> benchmarks/minillm_logits.json
+cargo run --release --bin parity_dump                 # forward path  -> benchmarks/minillm_logits.json
+cargo run --release --bin parity_dump -- --cache      # KV-cache path -> same file
 python benchmarks/parity.py benchmarks/minillm_logits.json
 ```
 
 `parity_dump` records the exact `input_ids` it used and the absolute path to the
 weights directory; `parity.py` loads the HF reference from that same directory
 with `local_files_only=True` and feeds it the same ids — so the check is
-tokenizer- and cache-independent. It compares the raw logits for the position
-right after the last prompt token.
+tokenizer-independent. It compares the raw logits for the position right after
+the last prompt token. With `--cache`, MiniLLM prefills all but the last token
+through the cache and feeds the last one as a single decode step, so the offset
+mask and the single-token path are exercised.
 
 Metrics: `mse`, `mae`, `max|Δ|`, cosine similarity,
 `KL(softmax(hf) || softmax(mini))`, top-1 match, top-5 set overlap.
@@ -93,17 +99,21 @@ activation, LayerNorm eps, position ids, tying).
 Reference: transformers 5.16.1, torch 2.13.0+cpu, numpy 2.5.2 · same fp32
 `benchmarks/gpt2/` weights.
 
-| aggregate | value |
-|---|---|
-| prompts | 24 |
-| mean mse | **1.996e-09** |
-| mean cosine similarity | **1.00000** |
-| mean KL(hf‖mini) | **3.984e-10** |
-| per-prompt max\|Δ\| (logit) | ~1–2 × 10⁻⁴ |
-| top-1 agreement | **24 / 24** |
-| top-5 overlap | **120 / 120** |
+| aggregate | `forward` | `--cache` |
+|---|---|---|
+| prompts | 24 | 24 |
+| mean mse | **1.996e-09** | **1.912e-09** |
+| mean cosine similarity | **1.00000** | **1.00000** |
+| mean KL(hf‖mini) | **3.984e-10** | **1.647e-10** |
+| per-prompt max\|Δ\| (logit) | ~1–2 × 10⁻⁴ | ~1–2 × 10⁻⁴ |
+| top-1 agreement | **24 / 24** | **24 / 24** |
+| top-5 overlap | **120 / 120** | **120 / 120** |
 
-MiniLLM's GPT-2 forward pass matches HuggingFace to floating-point noise.
+Both the full-recompute forward pass and the KV-cache decode path match
+HuggingFace to floating-point noise. The Rust integration test
+`tests/cache_parity.rs` additionally asserts that greedy generation with the
+cache yields the exact same token ids as `forward` (run:
+`cargo test --test cache_parity -- --ignored`).
 
 ## 3. Larger GPT-2 variants (optional)
 
@@ -111,8 +121,57 @@ MiniLLM's GPT-2 forward pass matches HuggingFace to floating-point noise.
 `-xl` (or a local dir for each). Record a row per size once weight loading for
 those is verified.
 
-| model | params | load (s) | prefill tok/s | decode tok/s | peak RSS | mean cos vs HF |
+| model | params | load (s) | prefill tok/s | decode tok/s (cache) | peak RSS | mean cos vs HF |
 |---|---|---|---|---|---|---|
-| gpt2 | 124M | 0.40 | 366 | 3.3 | 977 MiB | 1.00000 |
+| gpt2 | 124M | 0.4–0.6 | ~366 | ~43 (seq 64→192) | 977 MiB | 1.00000 |
 | gpt2-medium | 355M | | | | | |
 | gpt2-large | 774M | | | | | |
+
+## 4. Sequence-length sweep — KV cache on vs off (`sweep`)
+
+Sweeps a set of models against a set of prefill lengths, runs a greedy decode
+loop after each with the cache **off** and **on**, and writes one CSV row per
+`(model, prefill, kv_cache)` to stdout.
+
+```bash
+cargo run --release --bin sweep -- benchmarks/gpt2 16,64,128,256,512 32 both > benchmarks/sweep_cpu.csv
+# args: MODELS(comma-sep dirs/ids)  PREFILLS(comma-sep)  DECODE(steps)  CACHE(off|on|both)
+```
+
+Columns: `model,params,device,dtype,kv_cache,prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,prefill_tok_s,decode_tok_s,decode_s`.
+
+### Results — `openai-community/gpt2` (124M), fp32, CPU
+
+Same environment as §1. 32 greedy decode steps after each prefill;
+`benchmarks/sweep_cpu.csv` has the raw rows.
+
+| seq start | decode tok/s, no cache | decode tok/s, KV cache | speedup |
+|---|---|---|---|
+| 16 | 11.1 | 52.5 | 4.7× |
+| 64 | 5.2 | 50.2 | 9.6× |
+| 128 | 3.0 | 45.9 | 15.2× |
+| 256 | 1.6 | 38.4 | 23.5× |
+| 512 | 0.8 | 26.0 | 32.5× |
+
+No-cache decode ~halves per doubling of the sequence (O(n²)); the cached path
+degrades gently (growing K/V matmul + the per-step `cat` copy), so the speedup
+widens with context length.
+
+## 5. Perplexity (`ppl`)
+
+Sliding-window LM perplexity, for the KV-cache-quantization ablation (quality
+axis). Each target token is scored once, by the window with the most left
+context; NLL is `logsumexp(row) - row[target]`, accumulated on the CPU.
+
+```bash
+# one-time: fetch WikiText-2 raw test into one file
+#   dataset: https://huggingface.co/datasets/Salesforce/wikitext (wikitext-2-raw-v1, test split)
+#   concatenate the 'text' column into benchmarks/wikitext2.txt  (git-ignored)
+
+cargo run --release --bin ppl -- benchmarks/gpt2 benchmarks/wikitext2.txt 512 256 8192
+# args: MODEL  TEXT_FILE  WINDOW  STRIDE  MAX_TOKENS
+```
+
+Sanity: fp32 `gpt2` 124M gives perplexity ~29–30 on the WikiText-2 raw test
+split with `WINDOW=512 STRIDE=256`. A wildly different number means the harness
+is wrong (windowing, off-by-one on targets, stray special tokens).

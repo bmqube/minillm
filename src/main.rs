@@ -4,7 +4,7 @@ use minillm::{device, loader};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     let device = device::best();
     eprintln!("device: {device:?}");

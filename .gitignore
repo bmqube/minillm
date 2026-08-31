@@ -1,2 +1,6 @@
 /target
 .env
+
+# Benchmark working files (downloaded weights, generated logits)
+/benchmarks/gpt2/
+/benchmarks/minillm_logits.json

@@ -24,7 +24,7 @@ impl GPT2Model {
 
         let mut blocks = Vec::new();
         for i in 0..cfg.n_layer {
-            blocks.push(TransformerBlock::new(cfg, vb.pp(&format!("h.{}", i)))?);
+            blocks.push(TransformerBlock::new(cfg, vb.pp(format!("h.{i}")))?);
         }
 
         let ln_f = candle_nn::layer_norm(cfg.n_embd, 1e-5, vb.pp("ln_f"))?;

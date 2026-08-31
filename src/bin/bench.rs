@@ -1,10 +1,12 @@
 //! Throughput + size benchmark for MiniLLM.
 //!
 //! ```text
-//! cargo run --release --bin bench -- [MODEL_ID] [PREFILL_TOKENS] [DECODE_TOKENS]
+//! cargo run --release --bin bench -- [MODEL] [PREFILL_TOKENS] [DECODE_TOKENS]
 //! ```
 //!
-//! Defaults: `openai-community/gpt2 64 128`.
+//! Defaults: `benchmarks/gpt2 64 128`. `MODEL` is a local directory (with
+//! `config.json`, `tokenizer.json`, `model.safetensors`) or a Hub id like
+//! `openai-community/gpt2`.
 //!
 //! Reports model load time, analytic parameter count and fp32 weight memory,
 //! prefill latency, and greedy decode throughput. There is no KV cache yet, so
@@ -16,12 +18,10 @@ use minillm::{device, loader};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     let mut args = std::env::args().skip(1);
-    let model_id = args
-        .next()
-        .unwrap_or_else(|| "openai-community/gpt2".to_string());
+    let model_id = args.next().unwrap_or_else(|| "benchmarks/gpt2".to_string());
     let prefill: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(64);
     let decode: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(128);
 

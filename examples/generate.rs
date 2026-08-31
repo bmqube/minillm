@@ -9,7 +9,7 @@ use minillm::generation::{sample, SamplingConfig};
 use minillm::{device, loader};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     let prompt = std::env::args()
         .nth(1)

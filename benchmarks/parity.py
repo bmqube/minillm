@@ -53,9 +53,17 @@ def main():
     except ImportError as exc:  # pragma: no cover
         sys.exit(f"missing dependency: {exc}\n  pip install numpy torch transformers")
 
-    model_id = data.get("model", "openai-community/gpt2")
-    print(f"reference: {model_id} (HuggingFace Transformers)")
-    model = GPT2LMHeadModel.from_pretrained(model_id).eval()
+    import os
+
+    model_id = data.get("model", "benchmarks/gpt2")
+    is_local = os.path.isdir(model_id)
+    print(
+        f"reference: {model_id} "
+        f"({'local files' if is_local else 'HuggingFace Hub'}, Transformers)"
+    )
+    model = GPT2LMHeadModel.from_pretrained(
+        model_id, local_files_only=is_local
+    ).eval()
 
     header = (
         f"{'prompt':<34}{'mse':>11}{'mae':>9}{'max|d|':>9}"

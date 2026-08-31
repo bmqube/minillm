@@ -64,7 +64,10 @@ GPU build (requires a CUDA toolkit and a compatible driver):
 cargo build --release --features cuda
 ```
 
-Rust 1.74+ recommended.
+Rust 1.74+ recommended. Some dependencies compile native code (`ring`,
+`aws-lc-rs`, `onig_sys`), so a C toolchain is required: on Linux/macOS the
+system compiler is enough; on Windows use the MSVC build tools, or MSYS2
+`mingw-w64-gcc` with the `x86_64-pc-windows-gnu` Rust target.
 
 ## Usage
 
@@ -127,21 +130,31 @@ Weights, `config.json` and `tokenizer.json` are fetched via `hf-hub` and cached
 under `~/.cache/huggingface`. For gated or private repos, provide a token:
 
 ```bash
-echo "HF_TOKEN=hf_your_token_here" > .env      # loaded via dotenv
+echo "HF_TOKEN=hf_your_token_here" > .env      # loaded via dotenvy
 # or: export HF_TOKEN=hf_your_token_here
 ```
 
 ## Benchmarks
 
-See [`benchmarks/`](benchmarks/) for the harness and methodology.
+See [`benchmarks/`](benchmarks/) for the harness, methodology and full results.
 
 ```bash
-cargo run --release --bin bench -- openai-community/gpt2 64 128   # tok/s + size
-cargo run --release --bin parity_dump                             # dump logits
-python benchmarks/parity.py benchmarks/minillm_logits.json        # vs transformers
+# one-time: fetch GPT-2 weights into a local dir (see benchmarks/README.md)
+cargo run --release --bin bench -- benchmarks/gpt2 64 128     # tok/s + size
+cargo run --release --bin parity_dump                         # dump logits
+python benchmarks/parity.py benchmarks/minillm_logits.json    # vs transformers
 ```
 
-Numbers are filled into `benchmarks/README.md` from real runs, not estimates.
+Measured on a Ryzen 5 5600G, CPU, fp32, `openai-community/gpt2` (124M):
+
+| | |
+|---|---|
+| prefill (64 tok) | ~366 tok/s |
+| decode (128 steps, seq 64→192) | ~3.3 tok/s — **no KV cache yet** |
+| peak RSS | ~977 MiB |
+| parity vs HF Transformers (24 prompts) | mean cos `1.00000`, top-1 `24/24`, mean MSE `2.0e-9` |
+
+Numbers come from real runs, not estimates.
 
 ## Tests
 

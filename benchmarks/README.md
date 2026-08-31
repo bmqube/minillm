@@ -222,18 +222,25 @@ mean ± sample std over 3 trials. Raw rows in
 
 | model | prefill | no cache | KV cache | speedup |
 |---|---|---|---|---|
-| gpt2 124M | 16 | 16.82 ± 1.28 | 49.33 ± 3.74 | 2.9× |
-| gpt2 124M | 64 | 7.26 ± 0.13 | 45.52 ± 5.21 | 6.3× |
-| gpt2 124M | 128 | 3.91 ± 0.08 | 44.57 ± 1.51 | 11.4× |
-| Qwen3 0.6B | 16 | 2.44 ± 0.00 | 10.39 ± 0.01 | 4.3× |
-| Qwen3 0.6B | 64 | 1.30 ± 0.01 | 9.45 ± 0.11 | 7.3× |
-| Qwen3 0.6B | 128 | 0.75 ± 0.02 | 6.55 ± 0.41 | 8.7× |
+| gpt2 124M | 16 | 17.66 ± 1.60 | 53.09 ± 0.66 | 3.0× |
+| gpt2 124M | 64 | 7.19 ± 0.15 | 42.23 ± 8.25 | 5.9× |
+| gpt2 124M | 128 | 3.86 ± 0.18 | 42.15 ± 4.60 | 10.9× |
+| Qwen3 0.6B | 16 | 2.51 ± 0.01 | 11.34 ± 0.32 | 4.5× |
+| Qwen3 0.6B | 64 | 1.30 ± 0.01 | 10.57 ± 0.52 | 8.1× |
+| Qwen3 0.6B | 128 | 0.77 ± 0.00 | 8.51 ± 0.09 | 11.1× |
 
 Qwen3 is ~4.8× the parameters and lands at ~1/5 the cached decode rate, which is
 roughly what a memory-bandwidth-bound decode predicts. Its cache is 229,376
 B/token at fp32 against GPT-2's 73,728 — 3.1× larger despite grouped-query
 attention already halving it, because 28 layers × 128-wide heads outweighs
 GPT-2's 12 × 64. Without GQA it would be 6.2×.
+
+> The Qwen3 cached rows are ~26% faster than the first version of this table
+> because `attend` was forcing a contiguous copy of the expanded K and of V on
+> every step. `repeat_kv` already returns contiguous tensors and candle's matmul
+> takes the transposed stride directly, so both copies were pure overhead — the
+> same lesson as the GPT-2 `attend()` copy removed earlier. Parity was unchanged
+> either way, which is exactly why a correctness gate cannot be the only gate.
 
 These are small-context CPU numbers and should be read as a smoke test, not a
 result: the interesting regime for a KV cache is thousands of tokens on a GPU,
@@ -462,9 +469,9 @@ architecture that"`, scaled by the standard deviation of the reference logits
 | model | logit σ | int8 drift | int4 drift | int8 top-1 |
 |---|---|---|---|---|
 | gpt2 124M | 4.177 | **0.038 σ** | 0.228 σ | preserved |
-| Qwen3 0.6B | 2.597 | **0.282 σ** | **3.747 σ** | **changed** |
+| Qwen3 0.6B | 2.597 | **0.268 σ** | **3.525 σ** | **changed** (646 → 374) |
 
-Qwen3 is **~7× more sensitive to int8** and **~16× more to int4**. On this
+Qwen3 is **~7× more sensitive to int8** and **~15× more to int4**. On this
 prompt int8 flips its top-1 token (646 → 374) while GPT-2's is untouched, and
 int4's 3.7 σ drift means the cache is no longer approximating the model.
 

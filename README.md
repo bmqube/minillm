@@ -57,7 +57,7 @@ If you want to see the transformer built without a tensor framework, read the
 - **Quantized KV cache.** `KvQuant::Int8` (per-token symmetric) is 3.76× smaller
   and `KvQuant::Int4` (per-token asymmetric, packed) 6.4× smaller. On GPT-2 int8
   costs effectively nothing (Δppl ≈ +0.008 on WikiText-2) — **but that result
-  does not transfer to Qwen3**, which is ~7× more sensitive to int8 and ~16×
+  does not transfer to Qwen3**, which is ~7× more sensitive to int8 and ~15×
   more to int4, to the point where int8 changes the top-1 token on prompts GPT-2
   handles unaffected. See [Benchmarks](#benchmarks).
 - Larger sizes (`gpt2-medium/large/xl`, `Qwen3-1.7B` and up) share their

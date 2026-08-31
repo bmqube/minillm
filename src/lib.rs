@@ -8,17 +8,16 @@
 //!
 //! | Module | What lives there |
 //! |---|---|
-//! | [`models`] | The [`CausalLM`](models::CausalLM) trait and one module per architecture ([`gpt2`](models::gpt2), [`qwen3`](models::qwen3)) |
+//! | [`models`] | The [`CausalLM`] trait and one module per architecture ([`models::gpt2`], [`models::qwen3`]) |
 //! | [`layers`] | Primitives shared between architectures: activations, masks, RoPE, GQA head expansion |
 //! | [`kv_cache`] | The decode-time key/value store and its quantization modes |
 //! | [`generation`] | Sampling and the [`Generator`](generation::Generator) decode loop |
 //! | [`loader`] | Config parsing, architecture dispatch, sharded safetensors |
-//! | [`dtype`] | Compute [`Precision`](dtype::Precision) selection |
+//! | [`dtype`] | Compute [`Precision`] selection |
 //! | [`device`] | CPU / CUDA selection |
 //!
 //! Everything above [`models`] is architecture-agnostic: it talks to
-//! [`CausalLM`](models::CausalLM) and [`ModelMeta`](models::ModelMeta), never to
-//! a concrete model type.
+//! [`CausalLM`] and [`ModelMeta`], never to a concrete model type.
 //!
 //! # Example
 //!

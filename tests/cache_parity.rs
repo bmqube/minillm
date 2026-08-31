@@ -97,9 +97,9 @@ fn quantized_caches_stay_close(dir: &str) {
     // Measured drift, prefill on the fixed prompt:
     //
     //   gpt2 124M       int8 0.038 std   int4 0.228 std
-    //   qwen3 0.6B      int8 0.282 std   int4 3.747 std
+    //   qwen3 0.6B      int8 0.268 std   int4 3.525 std
     //
-    // Qwen3 is ~7x more sensitive to int8 and ~16x more to int4 than GPT-2 —
+    // Qwen3 is ~7x more sensitive to int8 and ~15x more to int4 than GPT-2 —
     // int4 KV genuinely degrades it. The limits below are regression guards set
     // above the observed values, not a claim that either number is fine; the
     // architecture gap is a result in its own right, recorded in benchmarks/.

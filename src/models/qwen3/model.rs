@@ -69,9 +69,11 @@ impl Qwen3Model {
             Linear::new(embed_tokens.embeddings().clone(), None)
         };
 
-        // One table covering every position the model can address. At bf16 this
-        // is `max_position_embeddings * head_dim` elements of cos plus the same
-        // of sin — ~10 MiB for Qwen3's 40960-position window, paid once at load.
+        // One table covering every position the model can address:
+        // `max_position_embeddings * head_dim / 2` elements each of cos and sin,
+        // paid once at load. For Qwen3's 40960-position window and head_dim 128
+        // that is ~10 MiB at bf16, ~21 MiB at fp32. A 128k-context checkpoint
+        // would want a cap here; at 40k it is not worth the extra knob.
         let rope = RotaryEmbedding::new(
             cfg.head_dim,
             cfg.max_position_embeddings,

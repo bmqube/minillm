@@ -137,7 +137,11 @@ impl Qwen3Attention {
         let k = repeat_kv(k, self.n_kv_groups)?;
         let v = repeat_kv(v, self.n_kv_groups)?;
 
-        let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        // `.transpose()` alone is a free stride-swap — candle's matmul takes the
+        // strided layout directly, and `repeat_kv` already returned a contiguous
+        // tensor. A `.contiguous()` here would copy the whole expanded K every
+        // decode step, which is the copy `attend` exists to avoid.
+        let scores = q.matmul(&k.transpose(2, 3)?)?;
         let mut scores = (scores * scale)?;
 
         if let Some(mask) = mask {
@@ -145,7 +149,7 @@ impl Qwen3Attention {
         }
 
         let weights = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = weights.matmul(&v.contiguous()?)?;
+        let out = weights.matmul(&v)?;
 
         // [b, n_head, q, head_dim] -> [b, q, n_head * head_dim]. The width is
         // `q_out`, not `hidden_size`; see the field's doc comment.

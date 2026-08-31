@@ -12,9 +12,12 @@
 //! prefill latency, and greedy decode throughput **both without and with the KV
 //! cache**, plus the speedup between them. The no-cache loop recomputes the whole
 //! sequence every step (O(n^2)); the cached loop feeds one token per step.
+//!
+//! This is the quick single-config smoke test — `sweep` is the data generator
+//! (multiple sequence lengths, quantization modes, and repeats).
 
 use candle_core::{IndexOp, Tensor};
-use minillm::kv_cache::KvCache;
+use minillm::generation::{greedy_no_cache, Generator, GREEDY};
 use minillm::{device, loader};
 use std::time::Instant;
 
@@ -48,7 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Warm-up: triggers lazy allocation / kernel selection.
     let warm = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-    let _ = model.forward(&warm)?.i((0, ids.len() - 1))?.to_vec1::<f32>()?;
+    let _ = model
+        .forward(&warm)?
+        .i((0, ids.len() - 1))?
+        .to_vec1::<f32>()?;
 
     // Prefill (full forward pass over the prompt).
     let t1 = Instant::now();
@@ -63,13 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // --- Decode without a KV cache: recompute the whole sequence every step. ---
-    let mut seq = ids.clone();
     let t2 = Instant::now();
-    for _ in 0..decode {
-        let input = Tensor::from_vec(seq.clone(), (1, seq.len()), &dev)?;
-        let row = model.forward(&input)?.i((0, seq.len() - 1))?.to_vec1::<f32>()?;
-        seq.push(argmax(&row) as u32);
-    }
+    greedy_no_cache(&model, &dev, &ids, decode)?;
     let nocache_s = t2.elapsed().as_secs_f64();
     let nocache_tps = decode as f64 / nocache_s;
     println!(
@@ -77,20 +78,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         prefill + decode
     );
 
-    // --- Decode with a KV cache: prefill once, then one token per step. ---
-    let mut cache = KvCache::new(model.config().n_layer);
-    let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-    let prime = model.forward_with_cache(&input, &mut cache)?;
-    let mut next = argmax(&prime.i((0, ids.len() - 1))?.to_vec1::<f32>()?) as u32;
-
+    // --- Decode with a KV cache: prefill once (untimed), then one token/step. ---
+    let mut generator = Generator::new(&model, &dev);
+    generator.prefill(&ids)?;
     let t3 = Instant::now();
     for _ in 0..decode {
-        let step = Tensor::from_vec(vec![next], (1, 1), &dev)?;
-        let row = model
-            .forward_with_cache(&step, &mut cache)?
-            .i((0, 0))?
-            .to_vec1::<f32>()?;
-        next = argmax(&row) as u32;
+        generator.next_token(&GREEDY)?;
     }
     let cache_s = t3.elapsed().as_secs_f64();
     let cache_tps = decode as f64 / cache_s;
@@ -101,20 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("speedup        : {:.1}x", cache_tps / nocache_tps);
 
     println!();
-    println!("peak RAM: measure externally, e.g.");
+    println!("peak RAM: measure with the `memprobe` binary, or externally:");
     println!("  Linux  : /usr/bin/time -v <cmd>   -> 'Maximum resident set size'");
     println!("  macOS  : /usr/bin/time -l <cmd>   -> 'maximum resident set size'");
     println!("  Windows: Get-Process bench | Select-Object PeakWorkingSet64");
 
     Ok(())
-}
-
-fn argmax(v: &[f32]) -> usize {
-    let mut best = 0usize;
-    for (i, &x) in v.iter().enumerate() {
-        if x > v[best] {
-            best = i;
-        }
-    }
-    best
 }

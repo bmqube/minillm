@@ -14,8 +14,8 @@
 //! One process = one mode on purpose: `bench` runs both paths, so its peak would
 //! just be the larger of the two.
 
-use candle_core::{IndexOp, Tensor};
-use minillm::kv_cache::{KvCache, KvQuant};
+use minillm::generation::{greedy, greedy_no_cache};
+use minillm::kv_cache::KvQuant;
 use minillm::{device, loader};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -36,29 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     match mode.as_str() {
         "off" => {
-            let mut seq = ids.clone();
-            for _ in 0..decode {
-                let input = Tensor::from_vec(seq.clone(), (1, seq.len()), &dev)?;
-                let row = model
-                    .forward(&input)?
-                    .i((0, seq.len() - 1))?
-                    .to_vec1::<f32>()?;
-                seq.push(argmax(&row));
-            }
+            greedy_no_cache(&model, &dev, &ids, decode)?;
         }
         "on" => {
-            let mut cache = KvCache::with_quant(model.config().n_layer, kv_quant);
-            let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-            let prime = model.forward_with_cache(&input, &mut cache)?;
-            let mut next = argmax(&prime.i((0, ids.len() - 1))?.to_vec1::<f32>()?);
-            for _ in 0..decode {
-                let step = Tensor::from_vec(vec![next], (1, 1), &dev)?;
-                let row = model
-                    .forward_with_cache(&step, &mut cache)?
-                    .i((0, 0))?
-                    .to_vec1::<f32>()?;
-                next = argmax(&row);
-            }
+            greedy(&model, &dev, &ids, decode, kv_quant)?;
         }
         other => return Err(format!("mode must be 'off' or 'on', got {other:?}").into()),
     }
@@ -81,16 +62,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         mib(analytic_kv as u64),
     );
     Ok(())
-}
-
-fn argmax(v: &[f32]) -> u32 {
-    let mut best = 0usize;
-    for (i, &x) in v.iter().enumerate() {
-        if x > v[best] {
-            best = i;
-        }
-    }
-    best as u32
 }
 
 /// Peak working set of the current process, in bytes (0 if unavailable).

@@ -1,6 +1,4 @@
-use candle_core::Tensor;
-use minillm::generation::{self, SamplingConfig};
-use minillm::kv_cache::KvCache;
+use minillm::generation::{Generator, SamplingConfig};
 use minillm::{device, loader};
 use std::time::Instant;
 
@@ -13,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (model, tokenizer) = loader::load("openai-community/gpt2", &device)?;
 
     let prompt = "The future of AI is";
-    let mut input_ids = tokenizer.encode(prompt, true)?.get_ids().to_vec();
+    let ids = tokenizer.encode(prompt, true)?.get_ids().to_vec();
     let max_new_tokens = 50;
     let eot = tokenizer.token_to_id("<|endoftext|>").unwrap_or(u32::MAX);
     let cfg = SamplingConfig {
@@ -25,26 +23,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Input: {prompt}");
     print!("Generated: ");
 
-    // Prefill: run the whole prompt through the model once, seeding the cache.
-    let mut cache = KvCache::new(model.config().n_layer);
-    let prompt_tensor = Tensor::from_vec(input_ids.clone(), (1, input_ids.len()), &device)?;
-    let mut logits = model.forward_with_cache(&prompt_tensor, &mut cache)?;
+    // Prefill the prompt once, then decode one token per step against the cache.
+    let mut generator = Generator::new(&model, &device);
+    generator.prefill(&ids)?;
 
     let start = Instant::now();
     let mut generated = 0usize;
     for _ in 0..max_new_tokens {
-        let next = generation::sample(&logits, &cfg)?;
+        let next = generator.next_token(&cfg)?;
         if next == eot {
             break;
         }
-
         print!("{}", tokenizer.decode(&[next], false)?);
-        input_ids.push(next);
         generated += 1;
-
-        // Decode: feed just the new token; the cache holds the rest.
-        let step = Tensor::from_vec(vec![next], (1, 1), &device)?;
-        logits = model.forward_with_cache(&step, &mut cache)?;
     }
     println!();
 

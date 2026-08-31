@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::Path;
 
 use candle_core::{IndexOp, Tensor};
-use minillm::kv_cache::KvCache;
+use minillm::generation::Generator;
 use minillm::model::GPT2Model;
 use minillm::{device, loader};
 
@@ -120,22 +120,15 @@ fn last_logits_cached(
     ids: &[u32],
     dev: &candle_core::Device,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut cache = KvCache::new(net.config().n_layer);
+    let mut generator = Generator::new(net, dev);
     let split = ids.len().saturating_sub(1);
 
     let logits = if split == 0 {
-        let input = Tensor::from_vec(ids.to_vec(), (1, ids.len()), dev)?;
-        net.forward_with_cache(&input, &mut cache)?
+        generator.prefill(ids)?.clone()
     } else {
-        let prefill = Tensor::from_vec(ids[..split].to_vec(), (1, split), dev)?;
-        let _ = net.forward_with_cache(&prefill, &mut cache)?;
-        let step = Tensor::from_vec(vec![ids[split]], (1, 1), dev)?;
-        net.forward_with_cache(&step, &mut cache)?
+        generator.prefill(&ids[..split])?;
+        generator.feed(ids[split])?.clone()
     };
 
-    let last = logits.dim(1)? - 1;
-    Ok(logits
-        .i((0, last))?
-        .to_dtype(candle_core::DType::F32)?
-        .to_vec1::<f32>()?)
+    Ok(logits.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?)
 }

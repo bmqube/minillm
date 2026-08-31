@@ -1,92 +1,81 @@
-//! Cache-path correctness: greedy generation with the KV cache must produce the
-//! exact same token ids as the plain full-recompute `forward`, and the prefill
-//! logits must match element-for-element.
+//! Cache-path correctness against the full-recompute reference.
 //!
 //! Needs GPT-2 weights in `benchmarks/gpt2/` (see `benchmarks/README.md`), so
-//! this is `#[ignore]` by default. Run it with:
+//! these are `#[ignore]` by default. Run with:
 //!
 //! ```text
 //! cargo test --test cache_parity -- --ignored
 //! ```
 
-use candle_core::{IndexOp, Tensor};
-use minillm::kv_cache::KvCache;
+use minillm::generation::{greedy, greedy_no_cache, Generator};
+use minillm::kv_cache::KvQuant;
 use minillm::{device, loader};
 
 const MODEL_DIR: &str = "benchmarks/gpt2";
+const PROMPT: &str = "A transformer is a deep learning architecture that";
+const STEPS: usize = 32;
 
-fn argmax(v: &[f32]) -> u32 {
-    let mut best = 0usize;
-    for (i, &x) in v.iter().enumerate() {
-        if x > v[best] {
-            best = i;
-        }
-    }
-    best as u32
-}
-
+/// Greedy decoding with an fp32 KV cache must produce the exact same token ids
+/// as recomputing the whole sequence every step.
 #[test]
 #[ignore = "requires benchmarks/gpt2 weights on disk"]
 fn cache_matches_no_cache() {
     let dev = device::best();
     let (model, tok) = loader::load(MODEL_DIR, &dev).expect("load benchmarks/gpt2");
+    let ids = tok.encode(PROMPT, true).unwrap().get_ids().to_vec();
 
-    let prompt = "A transformer is a deep learning architecture that";
-    let prompt_ids = tok.encode(prompt, true).unwrap().get_ids().to_vec();
-    let steps = 32;
-
-    // --- Reference: full recompute every step. ---
-    let mut ref_seq = prompt_ids.clone();
-    for _ in 0..steps {
-        let input = Tensor::from_vec(ref_seq.clone(), (1, ref_seq.len()), &dev).unwrap();
-        let row = model
-            .forward(&input)
-            .unwrap()
-            .i((0, ref_seq.len() - 1))
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        ref_seq.push(argmax(&row));
-    }
-
-    // --- KV cache: prefill once, then one token per step. ---
-    let mut cache = KvCache::new(model.config().n_layer);
-    let input = Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &dev).unwrap();
-    let prime = model.forward_with_cache(&input, &mut cache).unwrap();
-
-    // Prefill logits must match the plain forward exactly (same math).
-    let full = model.forward(&input).unwrap();
-    let a = full.i((0, prompt_ids.len() - 1)).unwrap().to_vec1::<f32>().unwrap();
-    let b = prime
-        .i((0, prompt_ids.len() - 1))
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-    let max_abs = a
-        .iter()
-        .zip(&b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0f32, f32::max);
-    assert!(max_abs < 1e-3, "prefill logits diverge: max|Δ| = {max_abs}");
-
-    let mut cache_seq = prompt_ids.clone();
-    let mut next = argmax(&b);
-    cache_seq.push(next);
-    for _ in 1..steps {
-        let step = Tensor::from_vec(vec![next], (1, 1), &dev).unwrap();
-        let row = model
-            .forward_with_cache(&step, &mut cache)
-            .unwrap()
-            .i((0, 0))
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        next = argmax(&row);
-        cache_seq.push(next);
-    }
+    let reference = greedy_no_cache(&model, &dev, &ids, STEPS).unwrap();
+    let cached = greedy(&model, &dev, &ids, STEPS, KvQuant::None).unwrap();
 
     assert_eq!(
-        ref_seq, cache_seq,
+        reference, cached,
         "KV-cache generation diverged from the full-recompute reference"
+    );
+}
+
+/// Quantized caches are lossy by construction, so they are not required to match
+/// token-for-token — but the prefill logits must stay close, and int8 must be
+/// closer than int4.
+#[test]
+#[ignore = "requires benchmarks/gpt2 weights on disk"]
+fn quantized_caches_stay_close_to_fp32() {
+    let dev = device::best();
+    let (model, tok) = loader::load(MODEL_DIR, &dev).expect("load benchmarks/gpt2");
+    let ids = tok.encode(PROMPT, true).unwrap().get_ids().to_vec();
+
+    let logits_for = |quant| {
+        let mut generator = Generator::with_quant(&model, &dev, quant);
+        generator
+            .prefill(&ids)
+            .unwrap()
+            .to_vec1::<f32>()
+            .expect("logits row")
+    };
+
+    let fp32 = logits_for(KvQuant::None);
+    let int8 = logits_for(KvQuant::Int8);
+    let int4 = logits_for(KvQuant::Int4);
+
+    let max_abs = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    };
+
+    let d8 = max_abs(&fp32, &int8);
+    let d4 = max_abs(&fp32, &int4);
+
+    assert!(
+        d8 < 0.5,
+        "int8 prefill logits drifted too far: max|d| = {d8}"
+    );
+    assert!(
+        d4 < 5.0,
+        "int4 prefill logits drifted too far: max|d| = {d4}"
+    );
+    assert!(
+        d8 < d4,
+        "int8 ({d8}) should be closer to fp32 than int4 ({d4})"
     );
 }

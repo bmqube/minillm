@@ -1,7 +1,8 @@
 //! Sliding-window language-model perplexity for MiniLLM.
 //!
 //! ```text
-//! cargo run --release --bin ppl -- [MODEL] [TEXT_FILE] [WINDOW] [STRIDE] [MAX_TOKENS]
+//! cargo run --release --bin ppl -- [--kv-quant off|int8|int4] \
+//!     [MODEL] [TEXT_FILE] [WINDOW] [STRIDE] [MAX_TOKENS]
 //! ```
 //!
 //! Defaults: `benchmarks/gpt2 benchmarks/wikitext2.txt 512 256 8192`.
@@ -19,10 +20,12 @@
 //! the raw logits (`logsumexp(row) - row[target]`) — the same scalar,
 //! obviously-correct style as `generation.rs`.
 //!
-//! There is no KV cache, so every window is a full `O(window^2)` attention
-//! recompute. That is fine for a once-off evaluation; a `--cache` mode is
-//! planned so the cache path can be perplexity-checked too (it must not change
-//! the number).
+//! Each window is one full `O(window^2)` forward pass — there is no incremental
+//! decoding to do, since every target's context is already in the window.
+//! `--kv-quant int8|int4` routes that pass through `forward_with_cache` with a
+//! quantized cache instead, so the logits reflect a quantized K/V history
+//! exactly as a decode loop would; `off` (the default) uses the plain forward
+//! and is the fp32 baseline.
 //!
 //! Auto-discovered by cargo as the `ppl` binary (like `bench` / `parity_dump`),
 //! so no `[[bin]]` entry in `Cargo.toml` is needed.
@@ -73,7 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let max_tokens: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8192);
 
     assert!(window >= 2, "WINDOW must be >= 2");
-    assert!(stride >= 1 && stride <= window, "need 1 <= STRIDE <= WINDOW");
+    assert!(
+        stride >= 1 && stride <= window,
+        "need 1 <= STRIDE <= WINDOW"
+    );
 
     let dev = device::best();
     eprintln!("device   : {dev:?}");
@@ -102,10 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert!(n >= 2, "need at least 2 tokens to score anything");
 
     let ctx = model.config().n_ctx;
-    assert!(
-        window <= ctx,
-        "WINDOW {window} exceeds model context {ctx}"
-    );
+    assert!(window <= ctx, "WINDOW {window} exceeds model context {ctx}");
 
     let t0 = Instant::now();
     let mut nll = 0.0f64; // sum of -log p(target) over all scored tokens

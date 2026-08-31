@@ -37,7 +37,7 @@ impl RotaryEmbedding {
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        if head_dim % 2 != 0 {
+        if !head_dim.is_multiple_of(2) {
             return Err(candle_core::Error::Msg(format!(
                 "RoPE needs an even head_dim, got {head_dim}"
             )));

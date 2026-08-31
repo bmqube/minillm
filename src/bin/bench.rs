@@ -5,12 +5,12 @@
 //! ```
 //!
 //! Defaults: `benchmarks/gpt2 64 128`. `MODEL` is a local directory (with
-//! `config.json`, `tokenizer.json`, `model.safetensors`) or a Hub id like
-//! `openai-community/gpt2`.
+//! `config.json`, `tokenizer.json`, and either `model.safetensors` or a shard
+//! index) or a Hub id like `openai-community/gpt2` / `Qwen/Qwen3-0.6B`.
 //!
-//! Reports model load time, analytic parameter count and fp32 weight memory,
-//! prefill latency, and greedy decode throughput **both without and with the KV
-//! cache**, plus the speedup between them. The no-cache loop recomputes the whole
+//! Reports model load time, analytic parameter count and weight memory, prefill
+//! latency, and greedy decode throughput **both without and with the KV cache**,
+//! plus the speedup between them. The no-cache loop recomputes the whole
 //! sequence every step (O(n^2)); the cached loop feeds one token per step.
 //!
 //! This is the quick single-config smoke test — `sweep` is the data generator
@@ -39,11 +39,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (model, _tok) = loader::load(&model_id, &dev)?;
     println!("load time      : {:.2} s", t0.elapsed().as_secs_f64());
 
-    let params = model.config().num_parameters();
+    let model = model.as_ref();
+    let meta = model.meta();
+    let precision = model.precision();
+    let params = meta.n_params;
+    println!("architecture   : {}", meta.architecture);
+    println!("precision      : {precision}");
     println!("parameters     : {params} (~{:.1} M)", params as f64 / 1e6);
     println!(
-        "fp32 weights   : ~{:.2} GiB",
-        (params as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0)
+        "weights        : ~{:.2} GiB",
+        (params as f64 * precision.size_in_bytes() as f64) / (1024.0 * 1024.0 * 1024.0)
+    );
+    println!(
+        "heads (q/kv)   : {}/{} (head_dim {}, {} KV group(s))",
+        meta.n_head,
+        meta.n_kv_head,
+        meta.head_dim,
+        meta.n_kv_groups()
+    );
+    println!(
+        "KV cache       : {} B/token at {precision}",
+        meta.kv_cache_bytes_per_token_at(precision)
     );
 
     // Deterministic pseudo-prompt: ids 0..prefill.
@@ -69,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // --- Decode without a KV cache: recompute the whole sequence every step. ---
     let t2 = Instant::now();
-    greedy_no_cache(&model, &dev, &ids, decode)?;
+    greedy_no_cache(model, &ids, decode)?;
     let nocache_s = t2.elapsed().as_secs_f64();
     let nocache_tps = decode as f64 / nocache_s;
     println!(
@@ -78,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // --- Decode with a KV cache: prefill once (untimed), then one token/step. ---
-    let mut generator = Generator::new(&model, &dev);
+    let mut generator = Generator::new(model);
     generator.prefill(&ids)?;
     let t3 = Instant::now();
     for _ in 0..decode {

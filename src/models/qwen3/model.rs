@@ -37,7 +37,10 @@ impl Qwen3Model {
             candle_core::Error::Msg(format!("unsupported model dtype {:?}", vb.dtype()))
         })?;
 
-        if cfg.num_attention_heads % cfg.num_key_value_heads != 0 {
+        if !cfg
+            .num_attention_heads
+            .is_multiple_of(cfg.num_key_value_heads)
+        {
             return Err(candle_core::Error::Msg(format!(
                 "num_attention_heads ({}) must be a multiple of num_key_value_heads ({})",
                 cfg.num_attention_heads, cfg.num_key_value_heads

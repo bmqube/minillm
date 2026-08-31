@@ -47,7 +47,7 @@ mod tests {
         // Reference from PyTorch nn.functional.gelu(approximate="tanh").
         let x = tensor(&[-2.0, -0.5, 0.0, 0.5, 2.0]);
         let got = vals(&gelu(&x).unwrap());
-        let want = [-0.0454022, -0.15428599, 0.0, 0.345714, 1.9545977];
+        let want = [-0.0454022, -0.154_286, 0.0, 0.345714, 1.9545977];
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "gelu: got {g}, want {w}");
         }

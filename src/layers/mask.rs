@@ -109,10 +109,7 @@ mod tests {
     fn sliding_window_drops_keys_outside_the_window() {
         // window = 2: position 3 sees keys 2 and 3 only.
         let m = causal_sliding(1, 5, 3, 2, DType::F32, &Device::Cpu).unwrap();
-        assert_eq!(
-            rows(&m)[0],
-            vec![MASK_NEG, MASK_NEG, 0.0, 0.0, MASK_NEG]
-        );
+        assert_eq!(rows(&m)[0], vec![MASK_NEG, MASK_NEG, 0.0, 0.0, MASK_NEG]);
     }
 
     #[test]

@@ -22,12 +22,16 @@ impl TransformerBlock {
 
         // Conv1D-style `[in, out]` weights, as in `attention.rs`.
         let mlp_c_fc_vb = vb.pp("mlp.c_fc");
-        let mlp_c_fc_weight = mlp_c_fc_vb.get((cfg.n_embd, 4 * cfg.n_embd), "weight")?.t()?;
+        let mlp_c_fc_weight = mlp_c_fc_vb
+            .get((cfg.n_embd, 4 * cfg.n_embd), "weight")?
+            .t()?;
         let mlp_c_fc_bias = mlp_c_fc_vb.get(4 * cfg.n_embd, "bias")?;
         let mlp_c_fc = Linear::new(mlp_c_fc_weight, Some(mlp_c_fc_bias));
 
         let mlp_c_proj_vb = vb.pp("mlp.c_proj");
-        let mlp_c_proj_weight = mlp_c_proj_vb.get((4 * cfg.n_embd, cfg.n_embd), "weight")?.t()?;
+        let mlp_c_proj_weight = mlp_c_proj_vb
+            .get((4 * cfg.n_embd, cfg.n_embd), "weight")?
+            .t()?;
         let mlp_c_proj_bias = mlp_c_proj_vb.get(cfg.n_embd, "bias")?;
         let mlp_c_proj = Linear::new(mlp_c_proj_weight, Some(mlp_c_proj_bias));
 

@@ -85,7 +85,12 @@ impl Qwen3Attention {
     ///
     /// QK-norm runs on the `[batch, seq, heads, head_dim]` layout, where the last
     /// axis is exactly one head's vector, before the transpose to head-major.
-    fn project_qkv(&self, x: &Tensor, offset: usize, rope: &RotaryEmbedding) -> Result<(Tensor, Tensor, Tensor)> {
+    fn project_qkv(
+        &self,
+        x: &Tensor,
+        offset: usize,
+        rope: &RotaryEmbedding,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (batch, seq, _) = x.dims3()?;
 
         let q = x

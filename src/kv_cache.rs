@@ -312,9 +312,7 @@ fn push(slot: &mut Option<Slot>, quant: KvQuant, new: &Tensor) -> Result<Tensor>
             let (q_new, s_new, z_new) = quantize_i4_per_token(&new)?;
             let (q, scale, zero) = match slot.take() {
                 None => (q_new, s_new, z_new),
-                Some(Slot::Q4 {
-                    q, scale, zero, ..
-                }) => (
+                Some(Slot::Q4 { q, scale, zero, .. }) => (
                     Tensor::cat(&[&q, &q_new], SEQ_DIM)?.contiguous()?,
                     Tensor::cat(&[&scale, &s_new], SEQ_DIM)?.contiguous()?,
                     Tensor::cat(&[&zero, &z_new], SEQ_DIM)?.contiguous()?,

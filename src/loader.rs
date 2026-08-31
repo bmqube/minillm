@@ -14,8 +14,8 @@ use hf_hub::{split_id, HFClientSync};
 use tokenizers::Tokenizer;
 
 use crate::dtype::Precision;
-use crate::models::{CausalLM, GPT2Model, Qwen3Model};
 use crate::models::{gpt2::GPT2Config, qwen3::Qwen3Config};
+use crate::models::{CausalLM, GPT2Model, Qwen3Model};
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -157,13 +157,16 @@ pub fn dir_files(dir: impl AsRef<Path>) -> Result<ModelFiles, BoxErr> {
     let weights = if single.is_file() {
         vec![single]
     } else if index.is_file() {
-        shard_names(&index)?.into_iter().map(|n| dir.join(n)).collect()
+        shard_names(&index)?
+            .into_iter()
+            .map(|n| dir.join(n))
+            .collect()
     } else {
         return Err(format!(
             "{} has neither {SINGLE_SAFETENSORS} nor {SAFETENSORS_INDEX}",
             dir.display()
         )
-        .into())
+        .into());
     };
 
     Ok(ModelFiles {

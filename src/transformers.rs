@@ -14,9 +14,9 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     pub fn new(cfg: &GPT2Config, vb: VarBuilder) -> Result<Self> {
-        let ln_1 = candle_nn::layer_norm(cfg.n_embd, 1e-5, vb.pp("ln_1"))?;
+        let ln_1 = candle_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln_1"))?;
         let attn = MultiHeadAttention::new(cfg, vb.pp("attn"))?;
-        let ln_2 = candle_nn::layer_norm(cfg.n_embd, 1e-5, vb.pp("ln_2"))?;
+        let ln_2 = candle_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln_2"))?;
 
         // Manually load and transpose MLP weights for GPT-2 compatibility
         let mlp_c_fc_vb = vb.pp("mlp.c_fc");

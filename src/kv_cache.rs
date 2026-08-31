@@ -16,6 +16,27 @@
 //! returns the **full**, full-precision K/V, so the caller attends the new
 //! queries over everything seen so far.
 //!
+//! # Cost — and what this implementation does *not* do
+//!
+//! Two deliberate simplifications shape every number in `benchmarks/`:
+//!
+//! 1. **`append` grows the cache with [`Tensor::cat`]**, which copies the whole
+//!    cache on every decode step. The step is still O(n) overall (the attention
+//!    matmul is O(n·head_dim) anyway), but the copy is a large constant, and
+//!    total decode work is O(n²) in *bytes moved*. A capacity-doubling
+//!    preallocated buffer written in place would remove it.
+//! 2. **Quantized modes dequantize the entire cache to fp32 on every step**, so
+//!    the attention matmul stays fp32. That adds a second O(n) pass per step on
+//!    top of the copy.
+//!
+//! Together these are why cached decode throughput still falls with context
+//! length, and why the quantized paths fall *faster* than fp32 (int4 more than
+//! int8 — nibble unpacking is heavier than a byte cast). They also mean
+//! quantization shrinks the **retained** footprint but not the transient one, so
+//! peak RSS does not move. Turning the memory saving into a speed and peak-RSS
+//! win requires a low-precision matmul or chunked dequantization, not a change
+//! to this container.
+//!
 //! # Quantized storage
 //!
 //! With [`KvQuant::Int8`] the *stored* K/V are held as `u8` (per-token symmetric
@@ -105,7 +126,10 @@ enum Slot {
     F32(Tensor),
     /// `q`: `u8` `[b, n_head, seq, head_dim]` (int8 biased by +128).
     /// `scale`: `f32` `[b, n_head, seq, 1]`.
-    Q8 { q: Tensor, scale: Tensor },
+    Q8 {
+        q: Tensor,
+        scale: Tensor,
+    },
     /// `q`: `u8` `[b, n_head, seq, head_dim / 2]` (two 0..15 nibbles per byte,
     /// low nibble = even index). `scale`, `zero`: `f32` `[b, n_head, seq, 1]`.
     Q4 {
@@ -261,12 +285,9 @@ fn mode_switch_err() -> candle_core::Error {
 /// `x ≈ (q_u8 - 128) * scale`.
 fn quantize_i8_per_token(x: &Tensor) -> Result<(Tensor, Tensor)> {
     let amax = x.abs()?.max_keepdim(D::Minus1)?; // [b,h,s,1]
-    // +eps so an all-zero row still gets a finite, invertible scale.
+                                                 // +eps so an all-zero row still gets a finite, invertible scale.
     let scale = ((amax + 1e-9)? / 127.0)?;
-    let q = x
-        .broadcast_div(&scale)?
-        .round()?
-        .clamp(-127f32, 127f32)?;
+    let q = x.broadcast_div(&scale)?.round()?.clamp(-127f32, 127f32)?;
     let q_u8 = (q + 128.0)?.to_dtype(DType::U8)?;
     Ok((q_u8, scale))
 }
@@ -334,7 +355,9 @@ impl KvCache {
     /// A cache whose every layer quantizes stored K/V with `quant`.
     pub fn with_quant(n_layer: usize, quant: KvQuant) -> Self {
         Self {
-            layers: (0..n_layer).map(|_| LayerKvCache::with_quant(quant)).collect(),
+            layers: (0..n_layer)
+                .map(|_| LayerKvCache::with_quant(quant))
+                .collect(),
             quant,
         }
     }
@@ -483,7 +506,10 @@ mod tests {
         let cache = KvCache::with_quant(4, KvQuant::Int8);
         assert_eq!(cache.n_layer(), 4);
         assert_eq!(cache.quant(), KvQuant::Int8);
-        assert_eq!(LayerKvCache::with_quant(KvQuant::Int8).quant(), KvQuant::Int8);
+        assert_eq!(
+            LayerKvCache::with_quant(KvQuant::Int8).quant(),
+            KvQuant::Int8
+        );
         assert_eq!(LayerKvCache::new().quant(), KvQuant::None);
     }
 
@@ -604,7 +630,12 @@ mod tests {
             2 * 12 * 768 / 2 + 2 * (2 * 12 * 12 * 4)
         );
         // int8 < fp32/3, int4 < int8
-        assert!(KvQuant::Int8.bytes_per_token(nl, nh, hd) * 3 < KvQuant::None.bytes_per_token(nl, nh, hd));
-        assert!(KvQuant::Int4.bytes_per_token(nl, nh, hd) < KvQuant::Int8.bytes_per_token(nl, nh, hd));
+        assert!(
+            KvQuant::Int8.bytes_per_token(nl, nh, hd) * 3
+                < KvQuant::None.bytes_per_token(nl, nh, hd)
+        );
+        assert!(
+            KvQuant::Int4.bytes_per_token(nl, nh, hd) < KvQuant::Int8.bytes_per_token(nl, nh, hd)
+        );
     }
 }

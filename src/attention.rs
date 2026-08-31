@@ -53,13 +53,7 @@ impl MultiHeadAttention {
     /// `k`/`v` are `[batch, n_head, kv_len, head_dim]`, and the optional additive
     /// `mask` is `[q_len, kv_len]`. Returns `[batch, q_len, n_embd]` after the
     /// output projection.
-    fn attend(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
+    fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (batch_size, _, q_len, head_dim) = q.dims4()?;
         let scale = 1.0 / (head_dim as f64).sqrt();
 

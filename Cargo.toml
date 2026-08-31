@@ -1,6 +1,6 @@
 [package]
 name = "minillm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["BM Monjur Morshed"]
 description = "A small GPT-2 inference engine in Rust, built on candle"

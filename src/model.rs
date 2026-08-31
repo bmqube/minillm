@@ -58,6 +58,12 @@ impl GPT2Model {
     /// autoregressive decoding.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
+        if seq_len > self.cfg.n_ctx {
+            return Err(candle_core::Error::Msg(format!(
+                "sequence length {seq_len} exceeds GPT-2 context window {}",
+                self.cfg.n_ctx
+            )));
+        }
 
         let positions = Tensor::arange(0, seq_len as i64, input_ids.device())?
             .unsqueeze(0)?

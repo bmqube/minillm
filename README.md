@@ -314,8 +314,18 @@ push and PR.
 
 - ~~KV cache~~ — done (`forward_with_cache`, ~11× faster CPU decode, parity-checked)
 - ~~int8 / int4 KV-cache quantization~~ — done (per-token, perplexity + latency + memory ablation)
+- ~~A second architecture~~ — done (Qwen3: RoPE, RMSNorm, GQA, QK-norm, SwiGLU, bf16, sharded checkpoints)
+- **GPU numbers** — the CPU tables stop at 512 tokens because that is where CPU
+  decode becomes unusable, which is also where a KV cache stops being
+  interesting. See [`benchmarks/GPU-RUNBOOK.md`](benchmarks/GPU-RUNBOOK.md).
+- **Confirm the int8 architecture gap on perplexity.** The Qwen3 sensitivity
+  result is currently a single-prompt logit measurement; 60k tokens of
+  WikiText-2 would either confirm it or show it up as an artifact.
+- Pre-RoPE and/or per-channel key quantization — the known fix for the drift
+  that section 8 of the benchmarks measures
+- Preallocated cache buffer (remove the per-step `Tensor::cat` copy)
 - Low-precision attention matmul (turn the memory saving into a peak-RSS + speed win)
-- Verify and benchmark `gpt2-medium/large/xl`
+- Verify and benchmark `gpt2-medium/large/xl`, `Qwen3-1.7B/4B/8B`
 - Batched generation
 
 ## License

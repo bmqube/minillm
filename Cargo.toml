@@ -1,16 +1,16 @@
 [package]
 name = "minillm"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["BM Monjur Morshed"]
-description = "A mini inference engine for running transformer language models"
+description = "A small GPT-2 inference engine in Rust, built on candle"
 license = "MIT"
 repository = "https://github.com/bmqube/minillm"
 homepage = "https://github.com/bmqube/minillm"
 documentation = "https://docs.rs/minillm"
 readme = "README.md"
-keywords = ["llm", "transformer", "inference", "gpt", "ai"]
-categories = ["algorithms", "science"]
+keywords = ["llm", "transformer", "inference", "gpt", "candle"]
+categories = ["algorithms"]
 exclude = ["target/", ".git/", ".gitignore"]
 
 [lib]
@@ -22,28 +22,21 @@ name = "minillm"
 path = "src/main.rs"
 
 [[example]]
-name = "basic_generation"
-path = "examples/basic_generation.rs"
+name = "generate"
+path = "examples/generate.rs"
 
-[[example]]
-name = "interactive_chat"
-path = "examples/interactive_chat.rs"
-
-[[example]]
-name = "tokenization"
-path = "examples/tokenization.rs"
+[features]
+# CPU-only by default so the crate builds on machines without CUDA.
+# Enable GPU with:  cargo build --release --features cuda
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 [dependencies]
-anyhow = "1.0.100"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
-candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
-clap = { version = "4.5.48", features = ["derive"] }
-dotenv = "0.15.0"
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.1" }
 hf-hub = "0.4.3"
-ndarray = "0.16.1"
-safetensors = "0.6.2"
-serde = {version = "1.0.225", features = ["derive"] }
-serde_json = "1.0.145"
 tokenizers = { version = "0.22.1", features = ["http"] }
+serde = { version = "1.0.225", features = ["derive"] }
+serde_json = "1.0.145"
 rand = "0.8"
+dotenv = "0.15.0"

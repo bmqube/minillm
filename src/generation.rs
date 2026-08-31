@@ -1,144 +1,233 @@
+//! Token sampling for autoregressive generation.
+//!
+//! Sampling is done on the CPU over a plain `Vec<f32>`: picking one token per
+//! step is cheap, and doing it in scalar Rust keeps the logic obviously correct
+//! (the previous tensor-based `nucleus_sampling` returned tokens in sorted order
+//! without mapping back to vocabulary ids).
+
 use candle_core::{IndexOp, Result, Tensor};
 
-// src/generation.rs
-pub fn top_k_sampling(logits: &Tensor, k: usize) -> Result<Tensor> {
-    if k == 0 {
-        return Ok(logits.clone());
-    }
-
-    let device = logits.device();
-    let shape = logits.shape();
-    let last_dim = shape.dims().len() - 1;
-    let vocab_size = shape.dims()[last_dim];
-
-    // If k is larger than vocabulary, return original logits
-    if k >= vocab_size {
-        return Ok(logits.clone());
-    }
-
-    // Sort in descending order
-    let (sorted_values, _sorted_indices) = logits.sort_last_dim(false)?;
-
-    // Get the threshold value (k-th largest value)
-    let threshold_values = sorted_values.narrow(last_dim, k - 1, 1)?;
-
-    // Broadcast threshold to match logits dimensions
-    let mut broadcast_shape = shape.dims().to_vec();
-    broadcast_shape[last_dim] = 1;
-    let threshold_reshaped = threshold_values.reshape(broadcast_shape)?;
-
-    // Expand to full size
-    let threshold_expanded = threshold_reshaped.broadcast_as(shape)?;
-
-    // Create mask: true where logits >= threshold
-    let mask = logits.ge(&threshold_expanded)?;
-
-    // Apply mask
-    let neg_inf = Tensor::full(-1e10f32, shape, device)?;
-    let result = logits.where_cond(&mask, &neg_inf)?;
-
-    Ok(result)
+/// How to turn a logits vector into the next token id.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingConfig {
+    /// Softmax temperature. `<= 1e-6` means greedy (argmax).
+    pub temperature: f64,
+    /// Keep only the `k` highest-scoring tokens. `None` or `Some(0)` disables it.
+    pub top_k: Option<usize>,
+    /// Nucleus sampling: keep the shortest ranked prefix whose cumulative
+    /// probability mass reaches `p`. `None` disables it.
+    pub top_p: Option<f64>,
 }
 
-pub fn nucleus_sampling(logits: &Tensor, p: f64) -> Result<Tensor> {
-    let device = logits.device();
-
-    // Convert logits to probabilities
-    let probs = candle_nn::ops::softmax_last_dim(logits)?;
-
-    // Sort probabilities in descending order
-    let (sorted_probs, _sorted_indices) = probs.sort_last_dim(false)?;
-
-    // Calculate cumulative probabilities
-    let last_dim = sorted_probs.dims().len() - 1;
-    let cumulative_probs = sorted_probs.cumsum(last_dim)?;
-
-    // Create mask: keep tokens where cumulative probability <= p
-    let p_tensor = Tensor::full(p as f32, cumulative_probs.shape(), device)?;
-    let nucleus_mask = cumulative_probs.le(&p_tensor)?;
-
-    // Apply mask using multiplication instead of where_cond to avoid dtype issues
-    let nucleus_mask_f32 = nucleus_mask.to_dtype(candle_core::DType::F32)?;
-    let masked_probs = (&sorted_probs * &nucleus_mask_f32)?;
-
-    // Add small epsilon to avoid log(0) and convert back to logits
-    let epsilon = 1e-10f32;
-    let epsilon_tensor = Tensor::full(epsilon, masked_probs.shape(), device)?;
-    let safe_probs = (masked_probs + epsilon_tensor)?;
-    let filtered_sorted_probs = safe_probs.log()?;
-
-    // For simplicity, return the filtered sorted probabilities as logits
-    // In a full implementation, you'd need to map back to original order using sorted_indices
-    Ok(filtered_sorted_probs)
-}
-
-pub fn temperature_scale(logits: &Tensor, temperature: f64) -> Result<Tensor> {
-    if temperature == 1.0 {
-        return Ok(logits.clone());
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: None,
+            top_p: None,
+        }
     }
-    logits / temperature
 }
 
-pub fn sample_token(logits: &Tensor) -> Result<u32> {
-    // Convert logits to probabilities
-    let probs = candle_nn::ops::softmax_last_dim(logits)?;
+/// Sample the next token id from a logits tensor.
+///
+/// Accepts logits shaped `[vocab]`, `[batch, vocab]` or `[batch, seq, vocab]`.
+/// For the batched shapes it uses batch index 0 and the final position.
+pub fn sample(logits: &Tensor, cfg: &SamplingConfig) -> Result<u32> {
+    let mut logits = last_step_logits(logits)?;
+    let greedy = cfg.temperature <= 1e-6;
 
-    // Get the last dimension (vocabulary size)
-    let shape = probs.shape();
-    let vocab_size = shape.dims()[shape.dims().len() - 1];
+    // Fast path: pure argmax.
+    if greedy && cfg.top_k.is_none() && cfg.top_p.is_none() {
+        return Ok(argmax(&logits) as u32);
+    }
 
-    // For 2D tensor [batch_size, seq_len, vocab_size], take the last token of the first batch
-    // For 3D tensor [batch_size, seq_len, vocab_size], take [0, -1, :] (first batch, last token)
-    let probs_1d = if shape.dims().len() == 3 {
-        // Shape: [batch_size, seq_len, vocab_size] -> take [0, -1, :]
-        let seq_len = shape.dims()[1];
-        probs.i((0, seq_len - 1))?
-    } else if shape.dims().len() == 2 {
-        // Shape: [batch_size, vocab_size] -> take [0, :]
-        probs.i(0)?
-    } else {
-        probs.clone()
-    };
-
-    // Convert to Vec<f32> for sampling
-    let probs_vec = probs_1d.to_vec1::<f32>()?; // Sample using cumulative distribution
-    let random_value: f32 = rand::random();
-    let mut cumulative_prob = 0.0;
-
-    for (i, &prob) in probs_vec.iter().enumerate() {
-        cumulative_prob += prob;
-        if random_value <= cumulative_prob {
-            return Ok(i as u32);
+    // Temperature.
+    if !greedy && (cfg.temperature - 1.0).abs() > f64::EPSILON {
+        let t = cfg.temperature as f32;
+        for l in logits.iter_mut() {
+            *l /= t;
         }
     }
 
-    // Fallback: return the last token index
-    Ok((vocab_size - 1) as u32)
+    // Rank tokens once by descending logit; top-k / top-p slice this order.
+    let mut ranked: Vec<usize> = (0..logits.len()).collect();
+    ranked.sort_unstable_by(|&a, &b| {
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // top-k: keep at most k candidates.
+    let mut keep = ranked.len();
+    if let Some(k) = cfg.top_k {
+        if k > 0 {
+            keep = keep.min(k);
+        }
+    }
+    let candidates = &ranked[..keep];
+
+    // Numerically stable softmax over the kept logits.
+    let max_l = candidates
+        .iter()
+        .map(|&i| logits[i])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = candidates.iter().map(|&i| (logits[i] - max_l).exp()).collect();
+    normalize(&mut probs);
+
+    // top-p (nucleus): truncate to the shortest prefix reaching mass p.
+    if let Some(p) = cfg.top_p {
+        let p = (p as f32).clamp(0.0, 1.0);
+        let mut cum = 0.0f32;
+        let mut cutoff = probs.len();
+        for (rank, &pr) in probs.iter().enumerate() {
+            cum += pr;
+            if cum >= p {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        probs.truncate(cutoff);
+        normalize(&mut probs);
+    }
+
+    // Temperature drove us to greedy but filters are active: argmax the survivors.
+    if greedy {
+        return Ok(ranked[argmax(&probs)] as u32);
+    }
+
+    // Sample from the categorical distribution over the ranked survivors.
+    let r: f32 = rand::random::<f32>();
+    let mut cum = 0.0f32;
+    for (rank, &pr) in probs.iter().enumerate() {
+        cum += pr;
+        if r <= cum {
+            return Ok(ranked[rank] as u32);
+        }
+    }
+    Ok(ranked[probs.len().saturating_sub(1)] as u32)
 }
 
+/// Backwards-compatible wrapper. Prefer [`sample`] with a [`SamplingConfig`].
 pub fn generate_token(
     logits: &Tensor,
     temperature: f64,
     top_k: Option<usize>,
     top_p: Option<f64>,
 ) -> Result<u32> {
-    let mut processed_logits = logits.clone();
+    sample(
+        logits,
+        &SamplingConfig {
+            temperature,
+            top_k,
+            top_p,
+        },
+    )
+}
 
-    // Apply temperature scaling
-    if temperature != 1.0 {
-        processed_logits = temperature_scale(&processed_logits, temperature)?;
+/// Copy the logits for the final position into a `Vec<f32>`.
+fn last_step_logits(logits: &Tensor) -> Result<Vec<f32>> {
+    let row = match logits.dims().len() {
+        1 => logits.clone(),
+        2 => logits.i(0)?,
+        3 => {
+            let seq_len = logits.dims()[1];
+            logits.i((0, seq_len - 1))?
+        }
+        n => {
+            return Err(candle_core::Error::Msg(format!(
+                "sample: expected logits of rank 1-3, got rank {n}"
+            )))
+        }
+    };
+    row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()
+}
+
+fn normalize(v: &mut [f32]) {
+    let sum: f32 = v.iter().sum();
+    if sum > 0.0 {
+        for x in v.iter_mut() {
+            *x /= sum;
+        }
+    }
+}
+
+fn argmax(v: &[f32]) -> usize {
+    let mut best = 0usize;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Tensor};
+
+    fn logits(v: &[f32]) -> Tensor {
+        Tensor::from_vec(v.to_vec(), (1, 1, v.len()), &Device::Cpu).unwrap()
     }
 
-    // Apply top-k filtering if specified
-    if let Some(k) = top_k {
-        processed_logits = top_k_sampling(&processed_logits, k)?;
+    #[test]
+    fn greedy_picks_argmax() {
+        let t = logits(&[0.1, 3.0, 0.2, -1.0]);
+        let cfg = SamplingConfig {
+            temperature: 0.0,
+            top_k: None,
+            top_p: None,
+        };
+        assert_eq!(sample(&t, &cfg).unwrap(), 1);
     }
 
-    // Apply nucleus (top-p) sampling if specified
-    if let Some(p) = top_p {
-        processed_logits = nucleus_sampling(&processed_logits, p)?;
+    #[test]
+    fn top_k_one_is_greedy() {
+        let t = logits(&[0.1, 0.2, 5.0, 0.2]);
+        let cfg = SamplingConfig {
+            temperature: 1.0,
+            top_k: Some(1),
+            top_p: None,
+        };
+        for _ in 0..25 {
+            assert_eq!(sample(&t, &cfg).unwrap(), 2);
+        }
     }
 
-    // Sample the final token
-    sample_token(&processed_logits)
+    #[test]
+    fn nucleus_keeps_dominant_token() {
+        // token 0 carries ~0.997 of the mass; p = 0.9 must always select it.
+        let t = logits(&[6.0, 0.0, 0.0, 0.0]);
+        let cfg = SamplingConfig {
+            temperature: 1.0,
+            top_k: None,
+            top_p: Some(0.9),
+        };
+        for _ in 0..50 {
+            assert_eq!(sample(&t, &cfg).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn samples_stay_in_vocab_range() {
+        let t = logits(&[1.0, 1.0, 1.0, 1.0, 1.0]);
+        let cfg = SamplingConfig::default();
+        for _ in 0..200 {
+            assert!(sample(&t, &cfg).unwrap() < 5);
+        }
+    }
+
+    #[test]
+    fn accepts_rank1_and_rank2() {
+        let r1 = Tensor::from_vec(vec![0.0f32, 9.0, 0.0], 3, &Device::Cpu).unwrap();
+        let r2 = Tensor::from_vec(vec![0.0f32, 0.0, 9.0], (1, 3), &Device::Cpu).unwrap();
+        let cfg = SamplingConfig {
+            temperature: 0.0,
+            top_k: None,
+            top_p: None,
+        };
+        assert_eq!(sample(&r1, &cfg).unwrap(), 1);
+        assert_eq!(sample(&r2, &cfg).unwrap(), 2);
+    }
 }

@@ -1,0 +1,27 @@
+# Fixed prompt set for MiniLLM parity + throughput checks.
+# One prompt per line. Lines starting with '#' and blank lines are ignored.
+# Keep this file stable so results stay comparable across runs.
+The future of artificial intelligence is
+In a shocking turn of events, scientists discovered
+The quick brown fox jumps over the lazy
+Once upon a time, there was a small village
+The capital of France is
+def fibonacci(n):
+Water boils at a temperature of
+The most important lesson I learned was
+Breaking news this morning:
+To be or not to be, that is the
+Machine learning models are trained on large amounts of
+The recipe calls for two cups of
+Yesterday I went to the store and bought
+The theory of relativity was developed by
+Climate change is caused primarily by
+She opened the door and saw
+The stock market fell sharply today after
+Rust is a systems programming language that
+The three branches of government are
+He picked up the phone and said
+A transformer is a deep learning architecture that
+The meaning of life, according to the philosopher
+After years of research, the team finally
+The old house at the end of the street

@@ -4,6 +4,7 @@ use candle_core::{Device, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
 
 pub struct GPT2Model {
+    cfg: GPT2Config,
     wte: candle_nn::Embedding, // Token embeddings
     wpe: candle_nn::Embedding, // Position embeddings
     blocks: Vec<TransformerBlock>,
@@ -12,6 +13,11 @@ pub struct GPT2Model {
 }
 
 impl GPT2Model {
+    /// The configuration this model was built from.
+    pub fn config(&self) -> &GPT2Config {
+        &self.cfg
+    }
+
     pub fn new(cfg: &GPT2Config, vb: VarBuilder) -> Result<Self> {
         let wte = candle_nn::embedding(cfg.vocab_size, cfg.n_embd, vb.pp("wte"))?;
         let wpe = candle_nn::embedding(cfg.n_ctx, cfg.n_embd, vb.pp("wpe"))?;
@@ -37,6 +43,7 @@ impl GPT2Model {
             };
 
         Ok(Self {
+            cfg: cfg.clone(),
             wte,
             wpe,
             blocks,

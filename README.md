@@ -1,218 +1,175 @@
-# MiniLLM 🤖
+# MiniLLM
 
-A lightweight, efficient transformer inference engine written in Rust. MiniLLM provides a clean, well-documented implementation of GPT-2 style transformer models with support for text generation.
+A small GPT-2 inference engine written in Rust. It loads GPT-2 checkpoints from
+the HuggingFace Hub and runs autoregressive text generation on CPU or CUDA.
 
-## ✨ Features
+## Two implementations
 
-- **🚀 Fast Inference**: Efficient tensor operations using ndarray
-- **🔒 Memory Safe**: Written in Rust with zero-copy operations where possible  
-- **📦 Easy to Use**: High-level API for quick integration
-- **🎯 Well Tested**: Comprehensive examples and documentation
-- **🔧 Extensible**: Modular architecture for easy customization
-- **🤖 GPT-2 Compatible**: Load and run GPT-2 models from HuggingFace
-- **📊 SafeTensors Support**: Fast and secure model weight loading
+| Branch | What it is |
+|---|---|
+| **`main`** (this branch) | Built on [`candle`](https://github.com/huggingface/candle) for tensor ops and the nn primitives. GPU support, less low-level code to maintain. This is the base for ongoing work. |
+| **[`scratch`](https://github.com/bmqube/minillm/tree/scratch)** | The original **from-scratch** version: a hand-written tensor library (`src/tensor.rs`, ~1D–4D, matmul / softmax / layernorm) with no ML dependencies, plus the full GPT-2 forward pass on top of it. CPU only. Kept as a reference for the ground-up implementation. |
 
-## 🏗️ Architecture
+If you want to see the transformer built without a tensor framework, read the
+`scratch` branch. If you want to run models, use `main`.
+
+## Status and scope
+
+- **Works:** GPT-2 (`openai-community/gpt2`) weight loading, forward pass,
+  greedy / temperature / top-k / top-p sampling, CPU and CUDA execution.
+- **fp32 only.** No quantization.
+- **No KV cache yet.** Each generation step recomputes the whole sequence, so
+  decoding is O(n²) in sequence length. This is the next planned change; the
+  [benchmarks](benchmarks/) establish the pre-cache baseline.
+- Larger GPT-2 sizes (`gpt2-medium/large/xl`) share the architecture and should
+  load, but only the 124M base model is regularly exercised.
+- Inference only — no training.
+
+## Architecture
 
 ```
 src/
-├── lib.rs          # Library entry point and public API
-├── main.rs         # Simple CLI example (clean 27 lines)
-├── inference.rs    # High-level inference engine
-├── gpt.rs          # GPT model implementation
-├── transformer.rs  # Transformer block components
-├── attention.rs    # Multi-head attention mechanism
-├── mlp.rs          # Feed-forward network layers
-├── tensor.rs       # Tensor operations and math
-├── weights.rs      # Model weight loading (SafeTensors)
-└── config.rs       # Model configuration handling
+├── lib.rs          library root
+├── main.rs         CLI demo (loads gpt2, generates 50 tokens)
+├── loader.rs       download config + tokenizer + safetensors from the HF Hub
+├── config.rs       GPT2Config + analytic parameter count
+├── model.rs        GPT2Model: embeddings, blocks, final norm, LM head, causal mask
+├── transformers.rs TransformerBlock: pre-LN attention + MLP with residuals
+├── attention.rs    MultiHeadAttention: fused QKV, scaled dot-product, causal mask
+├── activations.rs  tanh-approx GELU (matches GPT-2's gelu_new)
+├── generation.rs   SamplingConfig + sample(): greedy / temperature / top-k / top-p
+└── device.rs       pick CUDA if built with --features cuda, else CPU
+
+src/bin/
+├── bench.rs        throughput + size benchmark
+└── parity_dump.rs  dump logits for the parity check
 
 examples/
-├── basic_generation.rs  # Simple text generation
-├── interactive_chat.rs  # Interactive chat interface
-└── tokenization.rs      # Tokenization examples
+└── generate.rs     minimal library-usage example
+
+benchmarks/         prompt set, parity script, methodology + results
 ```
 
-## 🚀 Quick Start
+## Build
 
-### Library Usage
+CPU build (default, no CUDA toolkit needed):
+
+```bash
+cargo build --release
+```
+
+GPU build (requires a CUDA toolkit and a compatible driver):
+
+```bash
+cargo build --release --features cuda
+```
+
+Rust 1.74+ recommended.
+
+## Usage
+
+### CLI
+
+```bash
+cargo run --release                       # CPU
+cargo run --release --features cuda        # GPU
+```
+
+Downloads `openai-community/gpt2` on first run and prints a 50-token completion
+of a fixed prompt, followed by a tok/s line on stderr.
+
+### Library
 
 ```rust
-use minillm::inference::InferenceEngine;
+use candle_core::Tensor;
+use minillm::generation::{sample, SamplingConfig};
+use minillm::{device, loader};
 
-fn main() -> minillm::Result<()> {
-    // Load a GPT-2 model
-    let engine = InferenceEngine::new("openai-community/gpt2")?;
-    
-    // Generate text
-    let prompt = "The future of AI is";
-    let generated = engine.generate(prompt, 20)?;
-    
-    println!("Generated: {}", generated);
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dev = device::best();
+    let (model, tokenizer) = loader::load("openai-community/gpt2", &dev)?;
+
+    let mut ids = tokenizer.encode("The future of AI is", true)?.get_ids().to_vec();
+    let cfg = SamplingConfig { temperature: 0.8, top_k: Some(40), top_p: Some(0.95) };
+
+    for _ in 0..40 {
+        let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
+        let next = sample(&model.forward(&input)?, &cfg)?;
+        print!("{}", tokenizer.decode(&[next], false)?);
+        ids.push(next);
+    }
     Ok(())
 }
 ```
 
-### Command Line
+Run the same thing as an example:
 
 ```bash
-# Run the main example
-cargo run
-
-# Run specific examples  
-cargo run --example basic_generation
-cargo run --example interactive_chat
-cargo run --example tokenization
+cargo run --release --example generate -- "Once upon a time"
 ```
 
-## 📋 Requirements
+### Sampling options
 
-- Rust 1.70+
-- HuggingFace token (optional, for private models)
+`SamplingConfig` controls `sample(&logits, &cfg)`:
 
-Set your HuggingFace token:
-```bash
-echo "HF_TOKEN=your_token_here" > .env
-```
+| field | effect |
+|---|---|
+| `temperature: f64` | divides logits before softmax; `<= 1e-6` selects greedy (argmax) |
+| `top_k: Option<usize>` | keep only the `k` highest-scoring tokens |
+| `top_p: Option<f64>` | nucleus: keep the shortest ranked prefix whose probability mass reaches `p` |
 
-## 🔧 Dependencies
+Sampling runs on the CPU over a `Vec<f32>` — one token per step is cheap and the
+scalar code is easy to verify.
 
-- `ndarray` - Tensor operations
-- `safetensors` - Model weight loading
-- `tokenizers` - Text tokenization
-- `hf-hub` - HuggingFace model downloading
-- `serde` - Configuration parsing
+## Model loading
 
-## 📖 API Documentation
-
-### InferenceEngine
-
-The main high-level interface:
-
-```rust
-// Create engine
-let engine = InferenceEngine::new("openai-community/gpt2")?;
-
-// Generate text
-let result = engine.generate("prompt", max_tokens)?;
-
-// Tokenization
-let tokens = engine.tokenize("text")?;
-let text = engine.decode(&tokens)?;
-
-// Get model info
-let config = engine.config();
-```
-
-### Low-Level Components
-
-For custom implementations, you can use the individual components:
-
-- `GPTModel` - Complete transformer model
-- `TransformerBlock` - Individual transformer layers  
-- `MultiHeadAttention` - Attention mechanism
-- `MLP` - Feed-forward networks
-- `Tensor` - Mathematical operations
-
-## 🎯 Examples
-
-### Basic Generation
-```bash
-cargo run --example basic_generation
-```
-Demonstrates simple text generation with model configuration display.
-
-### Interactive Chat
-```bash
-cargo run --example interactive_chat
-```
-Interactive command-line chat interface with the model.
-
-### Tokenization
-```bash
-cargo run --example tokenization
-```
-Shows tokenization, encoding/decoding, and round-trip verification.
-
-## 📊 Performance
-
-MiniLLM is designed for inference efficiency:
-
-- **Memory**: ~1GB RAM for GPT-2 (117M parameters)
-- **Speed**: ~10-50 tokens/second (CPU, varies by hardware)
-- **Accuracy**: Identical outputs to reference implementations
-- **Models**: Currently supports GPT-2 architecture
-
-## 🛠️ Development
+Weights, `config.json` and `tokenizer.json` are fetched via `hf-hub` and cached
+under `~/.cache/huggingface`. For gated or private repos, provide a token:
 
 ```bash
-# Clone and build
-git clone https://github.com/bmqube/minillm
-cd minillm
-cargo build --release
+echo "HF_TOKEN=hf_your_token_here" > .env      # loaded via dotenv
+# or: export HF_TOKEN=hf_your_token_here
+```
 
-# Run tests
+## Benchmarks
+
+See [`benchmarks/`](benchmarks/) for the harness and methodology.
+
+```bash
+cargo run --release --bin bench -- openai-community/gpt2 64 128   # tok/s + size
+cargo run --release --bin parity_dump                             # dump logits
+python benchmarks/parity.py benchmarks/minillm_logits.json        # vs transformers
+```
+
+Numbers are filled into `benchmarks/README.md` from real runs, not estimates.
+
+## Tests
+
+```bash
 cargo test
-
-# Check examples
-cargo check --examples
-
-# Generate documentation
-cargo doc --open
 ```
 
-## 📚 Architecture Details
+Covers the samplers (greedy = argmax, `top_k = 1` is deterministic, nucleus
+keeps the dominant token, ids stay in range) and the analytic parameter count.
+Tests do not require downloading a model.
 
-### Transformer Implementation
-- **Multi-head attention** with causal masking
-- **Feed-forward networks** with GELU activation
-- **Layer normalization** and residual connections
-- **Position and token embeddings**
+## Roadmap
 
-### Tensor Operations
-- Dynamic 1D-4D tensor support
-- Optimized matrix multiplication
-- Element-wise operations (add, softmax, layer_norm)
-- Memory-efficient implementations
+- KV cache (single biggest inference speedup; benchmarked against the current baseline)
+- INT8 / INT4 weight-only quantization with a perplexity + latency + memory sweep
+- Verify and benchmark `gpt2-medium/large/xl`
+- Batched generation
 
-### Model Loading
-- SafeTensors format support
-- Automatic model downloading from HuggingFace
-- Configuration parsing and validation
-- Error handling with detailed messages
+## License
 
-## ✅ Current Status
+MIT — see [LICENSE](LICENSE).
 
-- ✅ **Core Architecture**: Complete GPT-2 implementation
-- ✅ **Inference Engine**: High-level API ready
-- ✅ **Examples**: Comprehensive usage examples
-- ✅ **Documentation**: Well-documented codebase
-- ✅ **Testing**: All components tested and working
+## Author
 
-## 🗺️ Roadmap
+BM Monjur Morshed — [@bmqube](https://github.com/bmqube)
 
-- [ ] **Performance**: GPU acceleration support
-- [ ] **Models**: Support for larger GPT variants
-- [ ] **Features**: Beam search and sampling options
-- [ ] **Optimization**: Quantization and pruning
-- [ ] **Integration**: Python bindings
+## Acknowledgments
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 🙏 Acknowledgments
-
-- Inspired by Andrej Karpathy's educational implementations
-- Built on the excellent Rust ecosystem (ndarray, tokenizers, etc.)
-- Model weights from HuggingFace transformers library
-
-## 👨‍💻 Author
-
-**BM Monjur Morshed**  
-- GitHub: [@bmqube](https://github.com/bmqube)
-- Project: [minillm](https://github.com/bmqube/minillm)
+- [candle](https://github.com/huggingface/candle) for tensors and nn primitives
+- HuggingFace for model weights and the tokenizers library
+- Inspired by Andrej Karpathy's educational GPT implementations

@@ -57,7 +57,11 @@ impl MultiHeadAttention {
         let (batch_size, _, q_len, head_dim) = q.dims4()?;
         let scale = 1.0 / (head_dim as f64).sqrt();
 
-        let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        // `.transpose()` alone is a free stride-swap (candle's CPU matmul takes
+        // strided layouts directly, the same way it does for the `.t()`-loaded
+        // Linear weights elsewhere in this crate); the `.contiguous()` that used
+        // to follow it forced a full copy of `k` on every attend() call.
+        let scores = q.matmul(&k.transpose(2, 3)?)?;
         let mut scores = (scores * scale)?;
 
         if let Some(mask) = mask {

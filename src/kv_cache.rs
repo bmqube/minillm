@@ -206,14 +206,17 @@ impl LayerKvCache {
     }
 
     /// The cached keys so far, dequantized, if any
-    /// (`[batch, n_head, seq, head_dim]`).
-    pub fn keys(&self) -> Option<Tensor> {
-        self.k.as_ref().and_then(|s| s.to_f32().ok())
+    /// (`[batch, n_head, seq, head_dim]`). `None` means nothing is cached yet;
+    /// `Some(Err(_))` is a genuine dequantization failure, kept distinct from
+    /// "empty" rather than swallowed.
+    pub fn keys(&self) -> Option<Result<Tensor>> {
+        self.k.as_ref().map(Slot::to_f32)
     }
 
-    /// The cached values so far, dequantized, if any.
-    pub fn values(&self) -> Option<Tensor> {
-        self.v.as_ref().and_then(|s| s.to_f32().ok())
+    /// The cached values so far, dequantized, if any. See [`keys`](Self::keys)
+    /// for what `None` vs. `Some(Err(_))` mean.
+    pub fn values(&self) -> Option<Result<Tensor>> {
+        self.v.as_ref().map(Slot::to_f32)
     }
 
     /// Append this step's `k_new` / `v_new` (each `[batch, n_head, s_new,
@@ -457,7 +460,7 @@ mod tests {
             c.append(&kv(1, 1.0), &kv(1, 2.0)).unwrap();
         }
         assert_eq!(c.len(), 9);
-        assert_eq!(c.keys().unwrap().dims(), &[1, 2, 9, 4]);
+        assert_eq!(c.keys().unwrap().unwrap().dims(), &[1, 2, 9, 4]);
     }
 
     #[test]
@@ -568,7 +571,7 @@ mod tests {
         let mut one = LayerKvCache::with_quant(KvQuant::Int8);
         let (k_one, _) = one.append(&x, &x).unwrap();
 
-        assert!(max_abs_diff(&k_one, &inc.keys().unwrap()) < 1e-5);
+        assert!(max_abs_diff(&k_one, &inc.keys().unwrap().unwrap()) < 1e-5);
     }
 
     #[test]
@@ -613,7 +616,7 @@ mod tests {
         let mut one = LayerKvCache::with_quant(KvQuant::Int4);
         let (k_one, _) = one.append(&x, &x).unwrap();
 
-        assert!(max_abs_diff(&k_one, &inc.keys().unwrap()) < 1e-5);
+        assert!(max_abs_diff(&k_one, &inc.keys().unwrap().unwrap()) < 1e-5);
     }
 
     #[test]

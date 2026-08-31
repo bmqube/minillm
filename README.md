@@ -22,15 +22,17 @@ If you want to see the transformer built without a tensor framework, read the
 - **Weights are fp32.** No weight quantization.
 - **KV cache.** `GPT2Model::forward_with_cache` decodes one token per step
   against a per-layer key/value cache — O(n) instead of the O(n²) full-recompute
-  `forward`. ~14× faster greedy decode on CPU at seq 64→192, and the cached path
-  still matches HuggingFace to fp32 noise (see [benchmarks](benchmarks/)). The
-  plain `forward` is kept as the reference and pre-cache baseline.
+  `forward`. ~11× faster greedy decode on CPU at seq 64→192 (up to ~31× by seq
+  512→544, see the sweep in [benchmarks](benchmarks/)), and the cached path
+  still matches HuggingFace to fp32 noise. The plain `forward` is kept as the
+  reference and pre-cache baseline; both it and the cached path skip `lm_head`
+  on positions the caller won't use (`forward_last` / `forward_with_cache_last`).
 - **Quantized KV cache.** `KvQuant::Int8` (per-token symmetric) is 3.76× smaller
-  for effectively no perplexity change (Δ ≈ +0.008 on WikiText-2) and ~3% slower
-  decode up to 128 tokens of context. `KvQuant::Int4` (per-token asymmetric,
-  packed) is 6.4× smaller for ~+3.8% perplexity and a 40–60% decode penalty.
-  Storage dequantizes to fp32 for the matmul, so peak RSS is unchanged either
-  way — see [benchmarks](benchmarks/).
+  for effectively no perplexity change (Δ ≈ +0.008 on WikiText-2) and ~4–10%
+  slower decode up to 256 tokens of context, ~20% by 512. `KvQuant::Int4`
+  (per-token asymmetric, packed) is 6.4× smaller for ~+3.8% perplexity and a
+  19–64% decode penalty. Storage dequantizes to fp32 for the matmul, so peak
+  RSS is unchanged either way — see [benchmarks](benchmarks/).
 - Larger GPT-2 sizes (`gpt2-medium/large/xl`) share the architecture and should
   load, but only the 124M base model is regularly exercised.
 - Inference only — no training.
@@ -43,7 +45,7 @@ src/
 ├── main.rs         CLI demo (loads gpt2, generates 50 tokens)
 ├── loader.rs       download config + tokenizer + safetensors from the HF Hub
 ├── config.rs       GPT2Config + analytic parameter / KV-cache-byte counts
-├── model.rs        GPT2Model: forward + forward_with_cache, embeddings, blocks, offset causal mask
+├── model.rs        GPT2Model: forward[_last] + forward_with_cache[_last], embeddings, blocks, offset causal mask
 ├── transformers.rs TransformerBlock: pre-LN attention + MLP with residuals, cache-aware variant
 ├── attention.rs    MultiHeadAttention: fused QKV, scaled dot-product, full + incremental paths
 ├── activations.rs  tanh-approx GELU (matches GPT-2's gelu_new)
@@ -148,6 +150,7 @@ Other entry points:
 | `generation::greedy_no_cache(&model, &dev, &ids, n)` | the O(n²) reference path |
 | `generation::sample_with(&logits, &cfg, &mut rng)` | seeded, reproducible sampling |
 | `Generator::next_token_with(&cfg, &mut rng)` | same, inside the decode loop |
+| `GPT2Model::forward_last` / `forward_with_cache_last` | only the final position's logits, skipping `lm_head` on the rest — what `Generator` and `greedy_no_cache` use internally |
 
 Greedy decoding (`temperature <= 1e-6`, no `top_k`/`top_p`) consumes no
 randomness, so every benchmark in this repo is deterministic. For reproducible
@@ -197,12 +200,12 @@ Measured on a Ryzen 5 5600G, CPU, fp32, `openai-community/gpt2` (124M):
 
 | | |
 |---|---|
-| prefill (64 tok) | ~360–420 tok/s |
-| decode (128 steps, seq 64→192), no cache | ~3 tok/s |
-| decode (128 steps, seq 64→192), **KV cache** | **~43 tok/s (≈14×)** |
+| prefill (64 tok) | ~485–510 tok/s |
+| decode (128 steps, seq 64→192), no cache | ~4.5 tok/s |
+| decode (128 steps, seq 64→192), **KV cache** | **~49–50 tok/s (≈11×)** |
 | peak RSS | ~977 MiB |
-| parity vs HF Transformers (24 prompts), forward | mean cos `1.00000`, top-1 `24/24`, mean MSE `2.0e-9` |
-| parity vs HF Transformers (24 prompts), KV-cache path | mean cos `1.00000`, top-1 `24/24`, mean MSE `1.9e-9` |
+| parity vs HF Transformers (24 prompts), forward | mean cos `1.00000`, top-1 `24/24`, mean MSE `1.8e-9` |
+| parity vs HF Transformers (24 prompts), KV-cache path | mean cos `1.00000`, top-1 `24/24`, mean MSE `2.2e-9` |
 
 Numbers come from real runs, not estimates.
 
@@ -233,12 +236,9 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo fmt --ch
 `cargo clippy --all-targets -D warnings`, the test suite and `cargo doc` on every
 push and PR.
 
-It asserts that greedy decoding with the cache produces the exact same token ids
-as the full-recompute `forward`.
-
 ## Roadmap
 
-- ~~KV cache~~ — done (`forward_with_cache`, ~14× faster CPU decode, parity-checked)
+- ~~KV cache~~ — done (`forward_with_cache`, ~11× faster CPU decode, parity-checked)
 - ~~int8 / int4 KV-cache quantization~~ — done (per-token, perplexity + latency + memory ablation)
 - Low-precision attention matmul (turn the memory saving into a peak-RSS + speed win)
 - Verify and benchmark `gpt2-medium/large/xl`

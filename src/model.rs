@@ -1,7 +1,7 @@
 use crate::config::GPT2Config;
 use crate::kv_cache::KvCache;
 use crate::transformers::TransformerBlock;
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
 
 pub struct GPT2Model {
@@ -20,6 +20,20 @@ impl GPT2Model {
     }
 
     pub fn new(cfg: &GPT2Config, vb: VarBuilder) -> Result<Self> {
+        // `activations::gelu` implements exactly one formula (the tanh
+        // approximation shared by "gelu_new" and "gelu_pytorch_tanh"); a
+        // checkpoint requesting a different activation would silently get the
+        // wrong one, so reject it instead.
+        match cfg.activation_function.as_str() {
+            "gelu_new" | "gelu_pytorch_tanh" => {}
+            other => {
+                return Err(candle_core::Error::Msg(format!(
+                    "unsupported activation_function {other:?}: this crate implements only \
+                     the gelu_new / gelu_pytorch_tanh tanh approximation"
+                )))
+            }
+        }
+
         let wte = candle_nn::embedding(cfg.vocab_size, cfg.n_embd, vb.pp("wte"))?;
         let wpe = candle_nn::embedding(cfg.n_ctx, cfg.n_embd, vb.pp("wpe"))?;
 
@@ -28,20 +42,20 @@ impl GPT2Model {
             blocks.push(TransformerBlock::new(cfg, vb.pp(format!("h.{i}")))?);
         }
 
-        let ln_f = candle_nn::layer_norm(cfg.n_embd, 1e-5, vb.pp("ln_f"))?;
+        let ln_f = candle_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln_f"))?;
 
-        // GPT-2 models typically share weights between wte and lm_head
-        // Try to load lm_head weights, fallback to wte weights if not found
-        let lm_head =
-            if let Ok(lm_head_weight) = vb.get((cfg.n_embd, cfg.vocab_size), "lm_head.weight") {
-                // lm_head exists, transpose it
-                let transposed_weight = lm_head_weight.t()?;
-                Linear::new(transposed_weight, None)
-            } else {
-                // lm_head doesn't exist, use wte weights (weight sharing)
-                let wte_weight = wte.embeddings().clone();
-                Linear::new(wte_weight, None)
-            };
+        // GPT-2 models typically share weights between wte and lm_head. If the
+        // checkpoint carries a separate `lm_head.weight`, it's stored `nn.Linear`-style
+        // as `(vocab_size, n_embd)` (no transpose needed, unlike the Conv1D-style
+        // `c_attn`/`c_proj`/`mlp.*` weights). Only fall back to the tied `wte`
+        // weights when the key is genuinely absent; a present-but-wrong-shape key
+        // is a real checkpoint mismatch and should error, not silently mis-load.
+        let lm_head = if vb.contains_tensor("lm_head.weight") {
+            let w = vb.get((cfg.vocab_size, cfg.n_embd), "lm_head.weight")?;
+            Linear::new(w, None)
+        } else {
+            Linear::new(wte.embeddings().clone(), None)
+        };
 
         Ok(Self {
             cfg: cfg.clone(),
@@ -55,8 +69,31 @@ impl GPT2Model {
 
     /// Full-sequence forward pass. Every call recomputes attention over the whole
     /// input; use [`forward_with_cache`](Self::forward_with_cache) for
-    /// autoregressive decoding.
+    /// autoregressive decoding. Runs `lm_head` over **every** position (needed by
+    /// callers like perplexity scoring, which score every position) — use
+    /// [`forward_last`](Self::forward_last) when only the final position's
+    /// logits are needed, e.g. greedy decode without a cache: the `lm_head`
+    /// matmul over `[seq, n_embd] x [n_embd, vocab]` dominates prefill-sized
+    /// inputs, and its output for every position but the last would otherwise be
+    /// computed and immediately discarded.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let hidden_states = self.hidden_states(input_ids)?;
+        hidden_states.apply(&self.lm_head)
+    }
+
+    /// [`forward`](Self::forward), but only the final position is projected
+    /// through `lm_head`. Returns `[batch, vocab]`. Numerically identical to
+    /// `forward(input_ids)` narrowed to its last position, at a fraction of the
+    /// `lm_head` cost.
+    pub fn forward_last(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let hidden_states = self.hidden_states(input_ids)?;
+        let last = hidden_states.dim(1)? - 1;
+        hidden_states.i((.., last, ..))?.apply(&self.lm_head)
+    }
+
+    /// Token + position embeddings through every block and the final LayerNorm —
+    /// everything [`forward`](Self::forward) does except the `lm_head` projection.
+    fn hidden_states(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
         if seq_len > self.cfg.n_ctx {
             return Err(candle_core::Error::Msg(format!(
@@ -79,8 +116,7 @@ impl GPT2Model {
             hidden_states = block.forward(&hidden_states, Some(&mask))?;
         }
 
-        let hidden_states = hidden_states.apply(&self.ln_f)?;
-        hidden_states.apply(&self.lm_head)
+        hidden_states.apply(&self.ln_f)
     }
 
     /// Incremental forward pass over `input_ids` (the **new** tokens only),
@@ -91,8 +127,32 @@ impl GPT2Model {
     /// afterwards. Position ids are offset by the cache length so `wpe` stays
     /// correct; a single-token step needs no attention mask, a multi-token step
     /// gets an offset causal mask. With an empty cache and the full sequence this
-    /// computes exactly what [`forward`](Self::forward) does.
+    /// computes exactly what [`forward`](Self::forward) does. Use
+    /// [`forward_with_cache_last`](Self::forward_with_cache_last) when only the
+    /// final position's logits are needed, e.g. the prefill step before a decode
+    /// loop.
     pub fn forward_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
+        let hidden_states = self.hidden_states_with_cache(input_ids, cache)?;
+        hidden_states.apply(&self.lm_head)
+    }
+
+    /// [`forward_with_cache`](Self::forward_with_cache), but only the final new
+    /// position is projected through `lm_head`. Returns `[batch, vocab]`. On a
+    /// single-token step (`new_seq == 1`, the common decode case) this does the
+    /// same work as `forward_with_cache`; the saving is on prefill, where
+    /// `new_seq` is the whole prompt.
+    pub fn forward_with_cache_last(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut KvCache,
+    ) -> Result<Tensor> {
+        let hidden_states = self.hidden_states_with_cache(input_ids, cache)?;
+        let last = hidden_states.dim(1)? - 1;
+        hidden_states.i((.., last, ..))?.apply(&self.lm_head)
+    }
+
+    /// Cache-aware counterpart of [`hidden_states`](Self::hidden_states).
+    fn hidden_states_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
         let past = cache.len();
         let total = past + seq_len;
@@ -129,8 +189,7 @@ impl GPT2Model {
                 block.forward_with_cache(&hidden_states, mask.as_ref(), cache.layer(i))?;
         }
 
-        let hidden_states = hidden_states.apply(&self.ln_f)?;
-        hidden_states.apply(&self.lm_head)
+        hidden_states.apply(&self.ln_f)
     }
 }
 

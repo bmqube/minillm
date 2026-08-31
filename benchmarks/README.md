@@ -76,9 +76,9 @@ candle 0.11.0 · `--release` · weights loaded from `benchmarks/gpt2/`.
 | load time (local files) | 0.4–0.6 s | — |
 | parameters | 124,439,808 | — |
 | fp32 weights | ~0.46 GiB | — |
-| prefill, 64 tok | **~366 tok/s** (360–420 across runs) | — |
-| decode, 128 steps (seq 64→192), no cache | **~3 tok/s** (~40 s) | — |
-| decode, 128 steps (seq 64→192), KV cache | **~43 tok/s** (~3 s) — **≈14× speedup** | — |
+| prefill, 64 tok | **~500 tok/s** (484–508 across runs) | — |
+| decode, 128 steps (seq 64→192), no cache | **~4.5 tok/s** (~28 s) | — |
+| decode, 128 steps (seq 64→192), KV cache | **~50 tok/s** (~2.6 s) — **≈11× speedup** | — |
 | peak RSS | **977 MiB** | — |
 
 _GPU row: run the `--features cuda` command on a machine with the CUDA toolkit._
@@ -120,9 +120,9 @@ Reference: transformers 5.16.1, torch 2.13.0+cpu, numpy 2.5.2 · same fp32
 | aggregate | `forward` | `--cache` |
 |---|---|---|
 | prompts | 24 | 24 |
-| mean mse | **1.996e-09** | **1.912e-09** |
+| mean mse | **1.772e-09** | **2.244e-09** |
 | mean cosine similarity | **1.00000** | **1.00000** |
-| mean KL(hf‖mini) | **3.984e-10** | **1.647e-10** |
+| mean KL(hf‖mini) | **1.697e-10** | **1.658e-10** |
 | per-prompt max\|Δ\| (logit) | ~1–2 × 10⁻⁴ | ~1–2 × 10⁻⁴ |
 | top-1 agreement | **24 / 24** | **24 / 24** |
 | top-5 overlap | **120 / 120** | **120 / 120** |
@@ -141,7 +141,7 @@ those is verified.
 
 | model | params | load (s) | prefill tok/s | decode tok/s (cache) | peak RSS | mean cos vs HF |
 |---|---|---|---|---|---|---|
-| gpt2 | 124M | 0.4–0.6 | ~366 | ~43 (seq 64→192) | 977 MiB | 1.00000 |
+| gpt2 | 124M | 0.4–0.6 | ~500 | ~50 (seq 64→192) | 977 MiB | 1.00000 |
 | gpt2-medium | 355M | | | | | |
 | gpt2-large | 774M | | | | | |
 
@@ -165,23 +165,27 @@ row's `kv_quant` (§6); `kv_quant` is `none` on `off` rows.
 Same environment as §1. 32 greedy decode steps after each prefill;
 `benchmarks/sweep_cpu.csv` has the raw rows.
 
-Mean ± sample std over **5 trials** per configuration (`--repeats 5`);
-`benchmarks/sweep_cpu.csv` has all 100 individual trials.
+Mean ± sample std over **3 trials** per configuration (`--repeats 3`);
+`benchmarks/sweep_cpu.csv` has all 60 individual trials.
 
 | seq start | decode tok/s, no cache | decode tok/s, KV cache | speedup |
 |---|---|---|---|
-| 16  | 11.76 ± 0.28 | 53.05 ± 1.08 | 4.5× |
-| 64  | 5.19 ± 0.05 | 49.95 ± 0.60 | 9.6× |
-| 128 | 2.96 ± 0.09 | 45.41 ± 1.36 | 15.3× |
-| 256 | 1.64 ± 0.01 | 40.91 ± 1.34 | 24.9× |
-| 512 | 0.80 ± 0.01 | 25.83 ± 0.14 | 32.3× |
+| 16  | 14.82 ± 0.99 | 53.53 ± 1.34 | 3.6× |
+| 64  | 6.83 ± 0.09 | 52.25 ± 0.89 | 7.7× |
+| 128 | 4.09 ± 0.05 | 49.87 ± 0.40 | 12.2× |
+| 256 | 2.19 ± 0.03 | 46.54 ± 2.46 | 21.3× |
+| 512 | 0.94 ± 0.10 | 28.89 ± 9.23 | 30.7× |
 
 No-cache decode ~halves per doubling of the sequence (O(n²)); the cached path
 degrades gently (growing K/V matmul + the per-step `cat` copy), so the speedup
 widens with context length.
 
 Run-to-run spread is 0.4–4% on an otherwise-idle box but can exceed 10% under
-load, so single-trial numbers are not trustworthy — always pass `--repeats`.
+load, so single-trial numbers are not trustworthy — always pass `--repeats`. This
+run's own seq-512 KV-cache row (±32%) is a case in point: its 3 trials were
+18.2, 34.0, 34.5 tok/s — one trial ran alongside other CPU-bound work in the
+same session. Prefer `--repeats 5` or more on an idle box for numbers you plan
+to cite.
 
 ## 5. Perplexity (`ppl`)
 
@@ -263,16 +267,47 @@ cargo run --release --bin memprobe -- on  992 32 benchmarks/gpt2 int4   # int4 c
 | 512  | 36 / 10 / 6 MiB | 977 / 977 / 977 / 977 MiB |
 | 1024 | 72 / 19 / 11 MiB | 977 / 977 / 977 / 977 MiB |
 
-Peak RSS does not move — with any cache setting. Two reasons: (1) the cache
-(≤72 MiB fp32) is smaller than the activation transient one prefill forward
-already allocates (`[1, seq, vocab]` fp32 logits alone are ~200 MiB at seq 1024),
-so peak stays pinned at the ~977 MiB weights+transient floor; (2) every quantized
-path still dequantizes the whole cache to fp32 for the attention matmul, so its
-transient footprint matches the fp32 cache. The **retained** footprint is what
-quantization shrinks — visible in the analytic column, not in peak RSS on this
-config. Realising a peak-RSS win needs a low-bit matmul or chunked dequant, or a
-regime where the cache is the dominant allocation (bigger model, longer context,
-batch > 1).
+Peak RSS does not move — with any cache setting, and it doesn't move because of
+the decode workload at all. Instrumenting peak RSS stage-by-stage shows the
+entire ~977 MiB floor is reached inside `loader::load`, before a single forward
+pass runs:
+
+```
+peak after startup     :   9.2 MiB
+peak after model load  : 977.2 MiB   <- floor reached here
+peak after 64+4 decode : 977.2 MiB   <- unchanged regardless of prefill/decode/quant
+peak after 992+32      : 977.2 MiB
+```
+
+The mechanism is `candle_nn::VarBuilder::from_mmaped_safetensors`: it mmaps
+`model.safetensors` (548 MiB), but `vb.get(...)` still *copies* each requested
+tensor out of the mapped view into a freshly owned `Tensor`. On Windows, pages
+touched through the mapped view count toward the process's working set the same
+as any other resident page, so loading ~124M fp32 params this way faults in
+roughly two copies of the weight bytes (~497 MiB mmap-view pages + ~497 MiB
+owned-tensor copies ≈ the observed 977 MiB) — once, during load, not per
+request. Peak RSS is a high-water mark that never falls back down over a
+process's lifetime, so this one-time load spike is the number every later
+`memprobe` invocation reports, regardless of what the decode loop does
+afterward. (An earlier version of this section attributed the floor to the
+prefill activation tensor — `[1, seq, vocab]` fp32 logits at ~200 MiB at seq
+1024 — that guess doesn't hold up against the fact that the floor is already
+reached before any forward pass runs, and prefill=64 vs. prefill=992 report the
+identical peak.)
+
+Given that, the KV cache (≤72 MiB fp32 even at the full 1024-token context) and
+its quantized variants are both far smaller than the load-time floor they sit
+under, so neither shows up in peak RSS on this config regardless of whether the
+attention matmul stays fp32. The **retained** footprint is still what
+quantization shrinks — visible in the analytic column. candle 0.11's
+`VarBuilder`/`safetensors` API has no zero-copy load path (`get()` always
+copies out of the mapped view; the non-mmap `candle_core::safetensors::load`
+copies the whole file into a buffer *and* copies out per-tensor, so it wouldn't
+help either), so halving the load-time floor would need a custom loader that
+aliases the mmap directly — out of scope here. A regime where the *cache*
+becomes the dominant allocation (bigger model, longer context, batch > 1) would
+still show quantization's retained-memory saving in peak RSS despite the fixed
+load-time floor.
 
 ## 7. KV-cache quantization ablation — int8 & int4
 
@@ -311,19 +346,21 @@ scheme with no full-precision residual for recent tokens.
 
 ### Speed — decode tok/s, `gpt2` 124M / CPU, 32 steps (`benchmarks/sweep_cpu.csv`)
 
-Mean ± std over 5 trials, same runs as §4.
+Mean ± std over 3 trials, same runs as §4.
 
 | seq start | fp32 | int8 | int4 |
 |---|---|---|---|
-| 16  | 53.05 ± 1.08 | 51.69 ± 0.55 (0.97×) | 43.35 ± 0.17 (0.82×) |
-| 64  | 49.95 ± 0.60 | 48.54 ± 0.36 (0.97×) | 33.89 ± 0.85 (0.68×) |
-| 128 | 45.41 ± 1.36 | 44.23 ± 1.35 (0.97×) | 26.38 ± 0.22 (0.58×) |
-| 256 | 40.91 ± 1.34 | 37.70 ± 1.49 (0.92×) | 17.13 ± 1.96 (0.42×) |
-| 512 | 25.83 ± 0.14 | 19.90 ± 0.13 (0.77×) | 9.64 ± 0.21 (0.37×) |
+| 16  | 53.53 ± 1.34 | 49.47 ± 3.21 (0.92×) | 43.24 ± 0.97 (0.81×) |
+| 64  | 52.25 ± 0.89 | 50.27 ± 0.83 (0.96×) | 35.07 ± 0.70 (0.67×) |
+| 128 | 49.87 ± 0.40 | 46.23 ± 0.45 (0.93×) | 27.78 ± 0.42 (0.56×) |
+| 256 | 46.54 ± 2.46 | 41.96 ± 1.73 (0.90×) | 18.26 ± 0.51 (0.39×) |
+| 512 | 28.89 ± 9.23 | 23.11 ± 0.91 (0.80×) | 10.33 ± 0.10 (0.36×) |
 
-int8 costs ~3% up to 128 tokens and 23% by 512; int4 starts at ~18% and reaches
-63%. Both still beat the no-cache rate (0.8–11.8 tok/s over this range) by a wide
-margin.
+int8 costs ~4–10% up to 256 tokens and ~20% by 512; int4 starts at ~19% and
+reaches ~64%. Both still beat the no-cache rate (0.9–14.8 tok/s over this range)
+by a wide margin. (The seq-512 fp32 mean carries one noisy trial — see the
+caveat under the §4 table; its own ratio to int8/int4 above is still directionally
+consistent with the other rows.)
 
 > **Why the quantized paths get slower with context — read this before citing the
 > speed numbers.** Two properties of `LayerKvCache` drive them, and both are
@@ -339,18 +376,23 @@ margin.
 > So these numbers bound how a *naive* low-bit KV path performs, not how int4
 > must perform. A preallocated write-in-place buffer removes (1); a low-precision
 > matmul or chunked dequant removes (2) and would also turn the retained-memory
-> saving into a peak-RSS saving.
+> saving into a peak-RSS saving. (A third, smaller contributor — `attend()`
+> forcing a fresh contiguous copy of the transposed K tensor on every call, on
+> top of (1) — has been removed: candle's CPU matmul takes the transposed,
+> non-contiguous layout directly, the same way it already does for this crate's
+> `.t()`-loaded Linear weights.)
 
 ### The frontier
 
 | mode | Δppl (60k) | retained KV | decode @ seq 128 |
 |---|---|---|---|
-| fp32 | — | 72 KiB/tok | 45.41 ± 1.36 tok/s |
-| **int8** | +0.008 (+0.03%) | 19 KiB/tok (3.8×) | 44.23 ± 1.35 (0.97×) |
-| **int4** | +1.13 (+3.8%) | 11 KiB/tok (6.4×) | 26.38 ± 0.22 (0.58×) |
+| fp32 | — | 72 KiB/tok | 49.87 ± 0.40 tok/s |
+| **int8** | +0.008 (+0.03%) | 19 KiB/tok (3.8×) | 46.23 ± 0.45 (0.93×) |
+| **int4** | +1.13 (+3.8%) | 11 KiB/tok (6.4×) | 27.78 ± 0.42 (0.56×) |
 
 int8 is essentially a free 3.8× memory cut — the quality change is at fp32-noise
-level and the speed cost is inside the error bars at this context length. int4
-buys another 1.7× compression for a real ~3.8% perplexity cost *and* a 42% speed
-cost. Realising the memory saving as lower *peak* RSS, and recovering the speed,
-both need the attention matmul itself to run at low precision.
+level and the ~7% speed cost at this context length is a small, real price, not
+noise (the trial spread here is ≤1 tok/s on both rows). int4 buys another 1.7×
+compression for a real ~3.8% perplexity cost *and* a ~44% speed cost. Realising
+the memory saving as lower *peak* RSS, and recovering the speed, both need the
+attention matmul itself to run at low precision.

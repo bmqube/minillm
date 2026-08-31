@@ -1,6 +1,9 @@
 /target
 .env
 
-# Benchmark working files (downloaded weights, generated logits)
+# Benchmark working files (downloaded weights, generated logits, run logs)
 /benchmarks/gpt2/
-/benchmarks/minillm_logits.json
+/benchmarks/gpt2-*/
+/benchmarks/minillm_logits*.json
+/benchmarks/wikitext2.txt
+/benchmarks/*.log

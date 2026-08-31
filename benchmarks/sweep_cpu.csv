@@ -1,0 +1,11 @@
+model,params,device,dtype,kv_cache,prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,prefill_tok_s,decode_tok_s,decode_s
+benchmarks/gpt2,124439808,Cpu,f32,off,16,32,16,48,0.388,64.8,246.81,11.107,2.881
+benchmarks/gpt2,124439808,Cpu,f32,on,16,32,16,48,0.388,64.8,246.81,52.533,0.609
+benchmarks/gpt2,124439808,Cpu,f32,off,64,32,64,96,0.388,151.6,422.18,5.234,6.114
+benchmarks/gpt2,124439808,Cpu,f32,on,64,32,64,96,0.388,151.6,422.18,50.174,0.638
+benchmarks/gpt2,124439808,Cpu,f32,off,128,32,128,160,0.388,286.2,447.30,3.015,10.613
+benchmarks/gpt2,124439808,Cpu,f32,on,128,32,128,160,0.388,286.2,447.30,45.903,0.697
+benchmarks/gpt2,124439808,Cpu,f32,off,256,32,256,288,0.388,581.1,440.51,1.629,19.644
+benchmarks/gpt2,124439808,Cpu,f32,on,256,32,256,288,0.388,581.1,440.51,38.364,0.834
+benchmarks/gpt2,124439808,Cpu,f32,off,512,32,512,544,0.388,1181.5,433.33,0.800,40.017
+benchmarks/gpt2,124439808,Cpu,f32,on,512,32,512,544,0.388,1181.5,433.33,26.019,1.230

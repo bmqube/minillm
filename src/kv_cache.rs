@@ -67,7 +67,8 @@ pub enum KvQuant {
     /// Per-token symmetric int8 (`u8` storage + one fp32 scale per
     /// `(batch, head, position)`). ~3.7× smaller retained footprint for `gpt2`.
     Int8,
-    /// Packed int4. Not implemented yet.
+    /// Per-token asymmetric int4, two values packed per `u8`, with an fp32
+    /// scale and zero-point per `(batch, head, position)`. ~6.4× smaller.
     Int4,
 }
 
@@ -83,26 +84,35 @@ impl KvQuant {
     }
 
     /// Bytes of *stored* cache per sequence position, given the model dims.
-    /// `None` is `2 * n_layer * n_embd * 4`; the quantized modes add a per-head
-    /// fp32 scale (`n_head` per layer per K/V).
+    /// `None` is `2 * n_layer * n_embd * 4`. The quantized modes store the values
+    /// narrower and add one fp32 scale per `(layer, head, position, K|V)`; `Int4`
+    /// also adds a zero-point.
     pub fn bytes_per_token(self, n_layer: usize, n_head: usize, head_dim: usize) -> usize {
         let elems = 2 * n_layer * n_head * head_dim; // K + V
         let scales = 2 * n_layer * n_head * 4; // fp32 scale per (layer, head), K + V
         match self {
             Self::None => elems * 4,
             Self::Int8 => elems + scales,
-            Self::Int4 => elems / 2 + scales,
+            Self::Int4 => elems / 2 + 2 * scales, // 4-bit values + scale + zero-point
         }
     }
 }
 
-/// One K or V tensor's storage: full precision, or per-token int8.
+/// One K or V tensor's storage: full precision, per-token int8, or per-token
+/// packed int4.
 #[derive(Debug)]
 enum Slot {
     F32(Tensor),
     /// `q`: `u8` `[b, n_head, seq, head_dim]` (int8 biased by +128).
     /// `scale`: `f32` `[b, n_head, seq, 1]`.
     Q8 { q: Tensor, scale: Tensor },
+    /// `q`: `u8` `[b, n_head, seq, head_dim / 2]` (two 0..15 nibbles per byte,
+    /// low nibble = even index). `scale`, `zero`: `f32` `[b, n_head, seq, 1]`.
+    Q4 {
+        q: Tensor,
+        scale: Tensor,
+        zero: Tensor,
+    },
 }
 
 impl Slot {
@@ -110,6 +120,7 @@ impl Slot {
         let t = match self {
             Slot::F32(t) => t,
             Slot::Q8 { q, .. } => q,
+            Slot::Q4 { q, .. } => q,
         };
         t.dims().get(SEQ_DIM).copied().unwrap_or(0)
     }
@@ -119,6 +130,7 @@ impl Slot {
         match self {
             Slot::F32(t) => Ok(t.clone()),
             Slot::Q8 { q, scale } => dequantize_i8(q, scale),
+            Slot::Q4 { q, scale, zero } => dequantize_i4(q, scale, zero),
         }
     }
 }
@@ -203,7 +215,7 @@ fn push(slot: &mut Option<Slot>, quant: KvQuant, new: &Tensor) -> Result<Tensor>
             let full = match slot.take() {
                 None => new,
                 Some(Slot::F32(prev)) => Tensor::cat(&[&prev, &new], SEQ_DIM)?.contiguous()?,
-                Some(Slot::Q8 { .. }) => return Err(mode_switch_err()),
+                Some(_) => return Err(mode_switch_err()),
             };
             *slot = Some(Slot::F32(full.clone()));
             Ok(full)
@@ -216,15 +228,27 @@ fn push(slot: &mut Option<Slot>, quant: KvQuant, new: &Tensor) -> Result<Tensor>
                     Tensor::cat(&[&q, &q_new], SEQ_DIM)?.contiguous()?,
                     Tensor::cat(&[&scale, &s_new], SEQ_DIM)?.contiguous()?,
                 ),
-                Some(Slot::F32(_)) => return Err(mode_switch_err()),
+                Some(_) => return Err(mode_switch_err()),
             };
             let full = dequantize_i8(&q, &scale)?;
             *slot = Some(Slot::Q8 { q, scale });
             Ok(full)
         }
-        KvQuant::Int4 => Err(candle_core::Error::Msg(
-            "KvQuant::Int4 is not implemented yet".into(),
-        )),
+        KvQuant::Int4 => {
+            let (q_new, s_new, z_new) = quantize_i4_per_token(&new)?;
+            let (q, scale, zero) = match slot.take() {
+                None => (q_new, s_new, z_new),
+                Some(Slot::Q4 { q, scale, zero }) => (
+                    Tensor::cat(&[&q, &q_new], SEQ_DIM)?.contiguous()?,
+                    Tensor::cat(&[&scale, &s_new], SEQ_DIM)?.contiguous()?,
+                    Tensor::cat(&[&zero, &z_new], SEQ_DIM)?.contiguous()?,
+                ),
+                Some(_) => return Err(mode_switch_err()),
+            };
+            let full = dequantize_i4(&q, &scale, &zero)?;
+            *slot = Some(Slot::Q4 { q, scale, zero });
+            Ok(full)
+        }
     }
 }
 
@@ -251,6 +275,47 @@ fn quantize_i8_per_token(x: &Tensor) -> Result<(Tensor, Tensor)> {
 fn dequantize_i8(q_u8: &Tensor, scale: &Tensor) -> Result<Tensor> {
     let q = (q_u8.to_dtype(DType::F32)? - 128.0)?;
     q.broadcast_mul(scale)?.contiguous()
+}
+
+/// Per-token asymmetric int4, two values packed per byte. `x`: `[b, n_head, seq,
+/// head_dim]` fp32, `head_dim` even. Returns `(q_u8 [b,h,s,hd/2], scale [b,h,s,1],
+/// zero [b,h,s,1])` with `x ≈ q * scale + zero` for the unpacked `q` in `0..=15`
+/// (low nibble = even index).
+fn quantize_i4_per_token(x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    let (b, h, s, hd) = x.dims4()?;
+    if hd % 2 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "int4 KV cache needs an even head_dim, got {hd}"
+        )));
+    }
+
+    let zero = x.min_keepdim(D::Minus1)?; // [b,h,s,1]
+    let xmax = x.max_keepdim(D::Minus1)?;
+    // +eps so a constant row still gets a finite, invertible scale.
+    let scale = ((xmax.broadcast_sub(&zero)? + 1e-9)? / 15.0)?;
+
+    let q = x
+        .broadcast_sub(&zero)?
+        .broadcast_div(&scale)?
+        .round()?
+        .clamp(0f32, 15f32)?;
+
+    // Pack (even, odd) nibble pairs: byte = lo + 16 * hi.
+    let q = q.reshape((b, h, s, hd / 2, 2))?;
+    let lo = q.narrow(4, 0, 1)?.squeeze(4)?;
+    let hi = q.narrow(4, 1, 1)?.squeeze(4)?;
+    let packed = (lo + (hi * 16.0)?)?.to_dtype(DType::U8)?;
+    Ok((packed, scale, zero))
+}
+
+/// Inverse of [`quantize_i4_per_token`].
+fn dequantize_i4(packed: &Tensor, scale: &Tensor, zero: &Tensor) -> Result<Tensor> {
+    let (b, h, s, hp) = packed.dims4()?;
+    let p = packed.to_dtype(DType::F32)?;
+    let hi = (p.clone() / 16.0)?.floor()?;
+    let lo = (p - (hi.clone() * 16.0)?)?;
+    let q = Tensor::stack(&[&lo, &hi], 4)?.reshape((b, h, s, hp * 2))?;
+    q.broadcast_mul(scale)?.broadcast_add(zero)?.contiguous()
 }
 
 /// The whole model's cache: one [`LayerKvCache`] per transformer block.
@@ -481,16 +546,65 @@ mod tests {
     }
 
     #[test]
+    fn int4_append_tracks_length_and_returns_fp32() {
+        let mut c = LayerKvCache::with_quant(KvQuant::Int4);
+        c.append(&kv_ramp(6), &kv_ramp(6)).unwrap();
+        assert_eq!(c.len(), 6);
+        let (k, _) = c.append(&kv_ramp(1), &kv_ramp(1)).unwrap();
+        assert_eq!(c.len(), 7);
+        assert_eq!(k.dims(), &[1, 2, 7, 4]);
+        assert_eq!(k.dtype(), DType::F32);
+    }
+
+    #[test]
+    fn int4_roundtrip_within_step_size() {
+        let mut c = LayerKvCache::with_quant(KvQuant::Int4);
+        let x = kv_ramp(10);
+        let (k, _) = c.append(&x, &x).unwrap();
+
+        let vals = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let (lo, hi) = vals
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        // per-token asymmetric int4: worst-case error is one step, (range)/15.
+        assert!(
+            max_abs_diff(&x, &k) <= (hi - lo) / 15.0 + 1e-4,
+            "int4 round-trip error {} exceeded {}",
+            max_abs_diff(&x, &k),
+            (hi - lo) / 15.0
+        );
+    }
+
+    #[test]
+    fn int4_incremental_matches_one_shot() {
+        let x = kv_ramp(5);
+
+        let mut inc = LayerKvCache::with_quant(KvQuant::Int4);
+        for t in 0..5 {
+            let xt = x.narrow(SEQ_DIM, t, 1).unwrap();
+            inc.append(&xt, &xt).unwrap();
+        }
+        let mut one = LayerKvCache::with_quant(KvQuant::Int4);
+        let (k_one, _) = one.append(&x, &x).unwrap();
+
+        assert!(max_abs_diff(&k_one, &inc.keys().unwrap()) < 1e-5);
+    }
+
+    #[test]
     fn bytes_per_token_matches_config_formula() {
         // gpt2-124M: n_layer=12, n_head=12, head_dim=64
-        assert_eq!(KvQuant::None.bytes_per_token(12, 12, 64), 2 * 12 * 768 * 4);
+        let (nl, nh, hd) = (12, 12, 64);
+        assert_eq!(KvQuant::None.bytes_per_token(nl, nh, hd), 2 * 12 * 768 * 4);
         assert_eq!(
-            KvQuant::Int8.bytes_per_token(12, 12, 64),
+            KvQuant::Int8.bytes_per_token(nl, nh, hd),
             2 * 12 * 768 + 2 * 12 * 12 * 4
         );
-        assert!(
-            KvQuant::Int8.bytes_per_token(12, 12, 64) * 3
-                < KvQuant::None.bytes_per_token(12, 12, 64)
+        assert_eq!(
+            KvQuant::Int4.bytes_per_token(nl, nh, hd),
+            2 * 12 * 768 / 2 + 2 * (2 * 12 * 12 * 4)
         );
+        // int8 < fp32/3, int4 < int8
+        assert!(KvQuant::Int8.bytes_per_token(nl, nh, hd) * 3 < KvQuant::None.bytes_per_token(nl, nh, hd));
+        assert!(KvQuant::Int4.bytes_per_token(nl, nh, hd) < KvQuant::Int8.bytes_per_token(nl, nh, hd));
     }
 }

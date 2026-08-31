@@ -149,15 +149,17 @@ Same environment as §1. 32 greedy decode steps after each prefill;
 
 | seq start | decode tok/s, no cache | decode tok/s, KV cache | speedup |
 |---|---|---|---|
-| 16 | 11.3 | 52.1 | 4.6× |
-| 64 | 5.1 | 49.0 | 9.7× |
-| 128 | 2.9 | 45.9 | 15.7× |
-| 256 | 1.6 | 37.8 | 23.5× |
-| 512 | 0.8 | 25.2 | 31.9× |
+| 16 | 9.5 | 41.3 | 4.3× |
+| 64 | 4.6 | 38.5 | 8.3× |
+| 128 | 2.7 | 38.0 | 14.1× |
+| 256 | 1.4 | 29.8 | 21.1× |
+| 512 | 0.7 | 21.2 | 30.2× |
 
 No-cache decode ~halves per doubling of the sequence (O(n²)); the cached path
 degrades gently (growing K/V matmul + the per-step `cat` copy), so the speedup
-widens with context length.
+widens with context length. Absolute tok/s vary ±15–20% run to run on a loaded
+CPU — the ratios and the shape are what's stable; proper error bars over repeats
+are future work.
 
 ## 5. Perplexity (`ppl`)
 
@@ -219,7 +221,10 @@ add one fp32 scale per `(layer, head, position, K|V)`
 |---|---|---|---|
 | fp32 | 73,728 (72 KiB) | 72 MiB | 1.00× |
 | int8 | 19,584 (19 KiB) | 19 MiB | 3.76× smaller |
-| int4 *(planned)* | 10,368 (10 KiB) | 10 MiB | 7.1× smaller |
+| int4 | 11,520 (11 KiB) | 11 MiB | 6.40× smaller |
+
+int8 adds one fp32 scale per `(layer, head, position, K|V)`; int4 packs two
+values per byte and adds a scale **and** a zero-point.
 
 **Measured** peak RSS, one decode path per process, `decode = 32`:
 
@@ -227,64 +232,85 @@ add one fp32 scale per `(layer, head, position, K|V)`
 cargo run --release --bin memprobe -- off 992 32            # full-recompute path
 cargo run --release --bin memprobe -- on  992 32 benchmarks/gpt2 none   # fp32 cache
 cargo run --release --bin memprobe -- on  992 32 benchmarks/gpt2 int8   # int8 cache
+cargo run --release --bin memprobe -- on  992 32 benchmarks/gpt2 int4   # int4 cache
 ```
 
-| seq end | analytic KV (fp32 / int8) | peak RSS: no cache / fp32 cache / int8 cache |
+| seq end | analytic KV (fp32 / int8 / int4) | peak RSS (no cache / fp32 / int8 / int4) |
 |---|---|---|
-| 128  | 9 / 2 MiB   | 977 / 977 / 977 MiB |
-| 512  | 36 / 10 MiB | 977 / 977 / 977 MiB |
-| 1024 | 72 / 19 MiB | 977 / 977 / 977 MiB |
+| 128  | 9 / 2 / 1 MiB   | 977 / 977 / 977 / 977 MiB |
+| 512  | 36 / 10 / 6 MiB | 977 / 977 / 977 / 977 MiB |
+| 1024 | 72 / 19 / 11 MiB | 977 / 977 / 977 / 977 MiB |
 
 Peak RSS does not move — with any cache setting. Two reasons: (1) the cache
 (≤72 MiB fp32) is smaller than the activation transient one prefill forward
 already allocates (`[1, seq, vocab]` fp32 logits alone are ~200 MiB at seq 1024),
-so peak stays pinned at the ~977 MiB weights+transient floor; (2) the int8 path
-still dequantizes the whole cache to fp32 for the attention matmul, so its
+so peak stays pinned at the ~977 MiB weights+transient floor; (2) every quantized
+path still dequantizes the whole cache to fp32 for the attention matmul, so its
 transient footprint matches the fp32 cache. The **retained** footprint is what
-int8 shrinks (3.76×) — visible in the analytic column, not in peak RSS on this
-config. Realising a peak-RSS win needs int8 matmul or chunked dequant, or a
+quantization shrinks — visible in the analytic column, not in peak RSS on this
+config. Realising a peak-RSS win needs a low-bit matmul or chunked dequant, or a
 regime where the cache is the dominant allocation (bigger model, longer context,
 batch > 1).
 
-## 7. KV-cache quantization ablation — int8
+## 7. KV-cache quantization ablation — int8 & int4
 
-`ppl`, `sweep` and `memprobe` all take a quant mode (`--kv-quant int8` for `ppl`;
-a `KVQUANT` positional for the others). `int8` stores each cached position's
-per-head K/V vector as `u8` with one fp32 scale — per-token symmetric int8,
-`x ≈ (q - 128) * scale` — and dequantizes the whole cache to fp32 for the
-attention matmul. The current token is quantized like every other.
+`ppl`, `sweep` and `memprobe` take a quant mode (`--kv-quant` for `ppl`; a
+`KVQUANT` positional for the others). Both modes quantize **per token**: one
+group per `(batch, head, position)` covering that position's `head_dim` vector,
+and every token — including the newest — is quantized. Storage is dequantized to
+fp32 for the attention matmul.
+
+- **int8** — symmetric, `u8` + fp32 scale, `x ≈ (q - 128) * scale`.
+- **int4** — asymmetric, two `0..15` nibbles packed per `u8`, + fp32 scale and
+  zero-point, `x ≈ q * scale + zero`.
 
 ```bash
 cargo run --release --bin ppl -- --kv-quant int8 benchmarks/gpt2 benchmarks/wikitext2.txt 512 256 60000
-cargo run --release --bin sweep -- benchmarks/gpt2 16,64,128,256,512 32 on int8
+cargo run --release --bin sweep -- benchmarks/gpt2 16,64,128,256,512 32 on int4
 ```
 
-**Quality** — WikiText-2 raw test, `WINDOW=512 STRIDE=256`:
+### Quality — WikiText-2 raw test, `WINDOW=512 STRIDE=256`
 
-| tokens scored | fp32 cache ppl | int8 cache ppl | Δppl | ΔNLL (nats/tok) |
-|---|---|---|---|---|
-| 8,191 | 33.4833 | 33.4849 | +0.0016 | +0.00004 |
-| 59,999 | 29.9394 | 29.9475 | +0.0081 | +0.00027 |
-
-Per-token int8 KV is effectively lossless — Δ is at the level of fp32 rounding.
-
-**Memory** — retained cache shrinks 3.76× (72 → 19 KiB/token; §6). Peak RSS is
-unchanged on this config (the attention path dequantizes to fp32).
-
-**Speed** — decode throughput, `gpt2` 124M / CPU, 32 steps
-(`benchmarks/sweep_cpu.csv`):
-
-| seq start | fp32 cache | int8 cache | int8 / fp32 |
+| tokens | fp32 ppl | int8 ppl (Δ) | int4 ppl (Δ) |
 |---|---|---|---|
-| 16  | 52.1 | 47.7 | 0.92× |
-| 64  | 49.0 | 47.2 | 0.96× |
-| 128 | 45.9 | 40.4 | 0.88× |
-| 256 | 37.8 | 33.8 | 0.89× |
-| 512 | 25.2 | 17.9 | 0.71× |
+| 8,191  | 33.4833 | 33.4849 (**+0.0016**) | 34.6856 (**+1.20**, +3.6%) |
+| 59,999 | 29.9394 | 29.9475 (**+0.0081**) | 31.0665 (**+1.13**, +3.8%) |
 
-int8 decode runs at ~0.9× the fp32-cache rate up to ~256 tokens and ~0.7× by
-512 — the per-step quantize + full-cache dequantize is overhead on a path that
-still does the matmul in fp32, and it grows with the cache length. It stays far
-above the no-cache rate. The trade: **3.76× smaller retained cache at ~0 quality
-loss, for ~10–30% slower decode** (widening with context) until the matmul
-itself goes int8.
+int8 is effectively lossless (Δ at fp32-rounding level). int4 is the first point
+where quality actually breaks — ~+3.6% perplexity, from the per-token asymmetric
+scheme with no full-precision residual for recent tokens.
+
+### Memory — retained cache (§6)
+
+| | fp32 | int8 | int4 |
+|---|---|---|---|
+| bytes/token | 73,728 | 19,584 (3.76× smaller) | 11,520 (6.40× smaller) |
+| peak RSS | — unchanged (fp32 dequant transient dominates) — | | |
+
+### Speed — decode tok/s, `gpt2` 124M / CPU, 32 steps (`benchmarks/sweep_cpu.csv`)
+
+| seq start | fp32 | int8 | int4 |
+|---|---|---|---|
+| 16  | 41.3 | 42.0 (1.02×) | 38.3 (0.93×) |
+| 64  | 38.5 | 42.8 (1.11×) | 28.3 (0.73×) |
+| 128 | 38.0 | 33.4 (0.88×) | 21.7 (0.57×) |
+| 256 | 29.8 | 26.8 (0.90×) | 14.1 (0.47×) |
+| 512 | 21.2 | 16.2 (0.76×) | 7.9 (0.37×) |
+
+(int8 ≥ fp32 at short sequences is within run-to-run noise; §4.) Both quantized
+paths are pure overhead on a matmul that stays fp32, and the penalty grows with
+cache length; int4's nibble pack/unpack is heavier than int8's cast. Both still
+beat the no-cache rate (0.7–9.5 tok/s over this range) by a wide margin.
+
+### The frontier
+
+| mode | Δppl (8k) | retained KV | decode @ seq 128 |
+|---|---|---|---|
+| fp32 | — | 72 KiB/tok | 38.0 tok/s |
+| **int8** | +0.002 | 19 KiB/tok (3.8×) | 33.4 tok/s (0.88×) |
+| **int4** | +1.20 | 11 KiB/tok (6.4×) | 21.7 tok/s (0.57×) |
+
+int8 is a near-free 3.8× memory cut; int4 buys another 1.7× compression for a
+real ~3.6% perplexity cost and a steeper decode penalty. Realising the memory
+saving as lower *peak* RSS, and recovering the speed, both need the attention
+matmul itself to run at low precision.

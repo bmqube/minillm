@@ -40,13 +40,30 @@
 //! against this same fp32 baseline at a fixed `MAX_TOKENS`.
 
 use candle_core::{DType, IndexOp, Tensor};
+use minillm::kv_cache::{KvCache, KvQuant};
 use minillm::{device, loader};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
 
-    let mut args = std::env::args().skip(1);
+    // `--kv-quant off|int8|int4` scores each window through forward_with_cache
+    // with a quantized KV cache instead of the plain forward pass. `off` (the
+    // default) uses the plain forward and is the fp32 baseline.
+    let mut positional: Vec<String> = Vec::new();
+    let mut kv_quant = KvQuant::None;
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--kv-quant" => {
+                let v = it.next().unwrap_or_default();
+                kv_quant = KvQuant::parse(&v)
+                    .unwrap_or_else(|| panic!("--kv-quant expects off|int8|int4, got {v:?}"));
+            }
+            _ => positional.push(a),
+        }
+    }
+    let mut args = positional.into_iter();
     let model_id = args.next().unwrap_or_else(|| "benchmarks/gpt2".to_string());
     let text_path = args
         .next()
@@ -59,10 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert!(stride >= 1 && stride <= window, "need 1 <= STRIDE <= WINDOW");
 
     let dev = device::best();
-    eprintln!("device : {dev:?}");
-    eprintln!("model  : {model_id}");
-    eprintln!("text   : {text_path}");
-    eprintln!("window : {window}   stride : {stride}   max_tokens : {max_tokens}");
+    eprintln!("device   : {dev:?}");
+    eprintln!("model    : {model_id}");
+    eprintln!("text     : {text_path}");
+    eprintln!("window   : {window}   stride : {stride}   max_tokens : {max_tokens}");
+    eprintln!("kv_quant : {kv_quant:?}");
 
     let (model, tokenizer) = loader::load(&model_id, &dev)?;
 
@@ -104,7 +122,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         let input = Tensor::from_vec(tokens[start..end].to_vec(), (1, len), &dev)?;
-        let logits = model.forward(&input)?.i(0)?.to_dtype(DType::F32)?; // [len, vocab]
+        let logits_full = match kv_quant {
+            KvQuant::None => model.forward(&input)?,
+            q => {
+                // Fresh cache per window; a single prefill call quantizes every
+                // position's K/V, so the logits reflect the int8-round-tripped
+                // cache exactly as a decode loop would.
+                let mut cache = KvCache::with_quant(model.config().n_layer, q);
+                model.forward_with_cache(&input, &mut cache)?
+            }
+        };
+        let logits = logits_full.i(0)?.to_dtype(DType::F32)?; // [len, vocab]
 
         // Score every target token whose absolute index is in `prev_end..end`
         // (each target is handled by exactly one window). Target `abs_t` is
@@ -131,6 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bits_per_token = mean_nll / std::f64::consts::LN_2;
 
     println!();
+    println!("kv_quant            : {kv_quant:?}");
     println!("windows scored      : {windows}");
     println!("tokens scored       : {scored}");
     println!("mean NLL (nats/tok) : {mean_nll:.5}");

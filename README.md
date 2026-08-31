@@ -17,12 +17,15 @@ If you want to see the transformer built without a tensor framework, read the
 
 - **Works:** GPT-2 (`openai-community/gpt2`) weight loading, forward pass,
   greedy / temperature / top-k / top-p sampling, CPU and CUDA execution.
-- **fp32 only.** No quantization.
+- **Weights are fp32.** No weight quantization.
 - **KV cache.** `GPT2Model::forward_with_cache` decodes one token per step
   against a per-layer key/value cache — O(n) instead of the O(n²) full-recompute
   `forward`. ~14× faster greedy decode on CPU at seq 64→192, and the cached path
   still matches HuggingFace to fp32 noise (see [benchmarks](benchmarks/)). The
   plain `forward` is kept as the reference and pre-cache baseline.
+- **int8 KV cache.** `KvQuant::Int8` stores cached K/V as per-token symmetric
+  int8 — 3.76× smaller retained cache for effectively no perplexity change
+  (Δ ≈ +0.008 on WikiText-2), ~10–30% slower decode. int4 is not done yet.
 - Larger GPT-2 sizes (`gpt2-medium/large/xl`) share the architecture and should
   load, but only the 124M base model is regularly exercised.
 - Inference only — no training.
@@ -34,19 +37,19 @@ src/
 ├── lib.rs          library root
 ├── main.rs         CLI demo (loads gpt2, generates 50 tokens)
 ├── loader.rs       download config + tokenizer + safetensors from the HF Hub
-├── config.rs       GPT2Config + analytic parameter count
+├── config.rs       GPT2Config + analytic parameter / KV-cache-byte counts
 ├── model.rs        GPT2Model: forward + forward_with_cache, embeddings, blocks, offset causal mask
 ├── transformers.rs TransformerBlock: pre-LN attention + MLP with residuals, cache-aware variant
 ├── attention.rs    MultiHeadAttention: fused QKV, scaled dot-product, full + incremental paths
 ├── activations.rs  tanh-approx GELU (matches GPT-2's gelu_new)
 ├── generation.rs   SamplingConfig + sample(): greedy / temperature / top-k / top-p
-├── kv_cache.rs     KvCache / LayerKvCache: per-layer key/value cache for O(n) decoding
+├── kv_cache.rs     KvCache / LayerKvCache: per-layer K/V cache, fp32 or per-token int8
 └── device.rs       pick CUDA if built with --features cuda, else CPU
 
 src/bin/
 ├── bench.rs        throughput + size benchmark, no-cache vs KV-cache decode
-├── sweep.rs        seq-len × model-size throughput sweep (cache on/off) → CSV
-├── ppl.rs          sliding-window perplexity on a text file
+├── sweep.rs        seq-len throughput sweep (cache off/on, fp32/int8) → CSV
+├── ppl.rs          sliding-window perplexity on a text file (--kv-quant off|int8)
 ├── memprobe.rs     peak-RSS probe for one decode path (KV-cache memory cost)
 └── parity_dump.rs  dump logits for the parity check (--cache exercises the cache path)
 
@@ -189,9 +192,10 @@ cargo test
 ```
 
 Covers the samplers (greedy = argmax, `top_k = 1` is deterministic, nucleus
-keeps the dominant token, ids stay in range), the analytic parameter count, and
-the `KvCache` container (append grows the sequence axis, `reset`, length
-tracking). These do not require downloading a model.
+keeps the dominant token, ids stay in range), the analytic parameter /
+KV-cache-byte counts, and the `KvCache` container (append grows the sequence
+axis, `reset`, length tracking, int8 round-trip error bound). These do not
+require downloading a model.
 
 The end-to-end KV-cache check needs GPT-2 weights in `benchmarks/gpt2/` and is
 `#[ignore]`d by default:
@@ -206,7 +210,8 @@ as the full-recompute `forward`.
 ## Roadmap
 
 - ~~KV cache~~ — done (`forward_with_cache`, ~14× faster CPU decode, parity-checked)
-- INT8 / INT4 KV-cache quantization with a perplexity + latency + memory sweep
+- ~~int8 KV-cache quantization~~ — done (per-token int8, perplexity + latency + memory sweep)
+- int4 KV-cache quantization (packed, per-head scale + zero-point)
 - Verify and benchmark `gpt2-medium/large/xl`
 - Batched generation
 

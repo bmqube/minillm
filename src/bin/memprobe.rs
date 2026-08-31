@@ -1,21 +1,21 @@
 //! Peak resident-set-size probe for the KV cache.
 //!
 //! ```text
-//! cargo run --release --bin memprobe -- <off|on> [PREFILL] [DECODE] [MODEL]
+//! cargo run --release --bin memprobe -- <off|on> [PREFILL] [DECODE] [MODEL] [KVQUANT]
 //! ```
 //!
-//! Defaults: `on 512 128 benchmarks/gpt2`. Loads the model, runs a greedy decode
-//! loop in the chosen path (`off` = full recompute, `on` = KV cache), then prints
-//! this process's peak RSS. Run it once per mode with the **same** `PREFILL` /
-//! `DECODE` and diff the two peaks to get the cache's real memory cost — which
-//! includes the transient doubling from each step's `Tensor::cat`, so it runs
-//! above the steady-state analytic figure.
+//! Defaults: `on 512 128 benchmarks/gpt2 none`. Loads the model, runs a greedy
+//! decode loop in the chosen path (`off` = full recompute, `on` = KV cache with
+//! `KVQUANT` storage `none`|`int8`), then prints this process's peak RSS. Run it
+//! once per mode with the **same** `PREFILL` / `DECODE` and diff the two peaks to
+//! get the cache's real memory cost — which includes the transient dequant to
+//! fp32 each step, so it runs above the steady-state analytic figure.
 //!
 //! One process = one mode on purpose: `bench` runs both paths, so its peak would
 //! just be the larger of the two.
 
 use candle_core::{IndexOp, Tensor};
-use minillm::kv_cache::KvCache;
+use minillm::kv_cache::{KvCache, KvQuant};
 use minillm::{device, loader};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -26,6 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prefill: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(512);
     let decode: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(128);
     let model_id = args.next().unwrap_or_else(|| "benchmarks/gpt2".into());
+    let kvq_arg = args.next().unwrap_or_else(|| "none".into());
+    let kv_quant = KvQuant::parse(&kvq_arg)
+        .unwrap_or_else(|| panic!("KVQUANT expects none|int8|int4, got {kvq_arg:?}"));
 
     let dev = device::best();
     let (model, _tok) = loader::load(&model_id, &dev)?;
@@ -44,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         "on" => {
-            let mut cache = KvCache::new(model.config().n_layer);
+            let mut cache = KvCache::with_quant(model.config().n_layer, kv_quant);
             let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
             let prime = model.forward_with_cache(&input, &mut cache)?;
             let mut next = argmax(&prime.i((0, ids.len() - 1))?.to_vec1::<f32>()?);
@@ -62,10 +65,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let peak = peak_rss_bytes();
     let seq_end = prefill + decode;
-    let analytic_kv = model.config().kv_cache_bytes_per_token(4) * seq_end;
+    let cfg = model.config();
+    let head_dim = cfg.n_embd / cfg.n_head;
+    let bpt = if mode == "on" {
+        kv_quant.bytes_per_token(cfg.n_layer, cfg.n_head, head_dim)
+    } else {
+        cfg.kv_cache_bytes_per_token(4)
+    };
+    let analytic_kv = bpt * seq_end;
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!(
-        "mode={mode} prefill={prefill} decode={decode} seq_end={seq_end} \
+        "mode={mode} kv_quant={kv_quant:?} prefill={prefill} decode={decode} seq_end={seq_end} \
          peak_rss_bytes={peak} peak_rss_mib={:.1} analytic_kv_mib={:.1}",
         mib(peak),
         mib(analytic_kv as u64),

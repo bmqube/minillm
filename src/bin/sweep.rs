@@ -114,19 +114,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // Warm-up (lazy alloc / kernel selection) — not timed, once per config.
             let warm = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-            let _ = model
-                .forward(&warm)?
-                .i((0, ids.len() - 1))?
-                .to_vec1::<f32>()?;
+            let _ = model.forward_last(&warm)?.i(0)?.to_vec1::<f32>()?;
 
             for repeat in 1..=repeats {
-                // Prefill (full forward over the prompt), timed per trial.
+                // Prefill (full forward over the prompt, only the final position's
+                // logits kept via `forward_last` — what a real decode session
+                // actually needs), timed per trial.
                 let t1 = Instant::now();
                 let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-                let _ = model
-                    .forward(&input)?
-                    .i((0, ids.len() - 1))?
-                    .to_vec1::<f32>()?;
+                let _ = model.forward_last(&input)?.i(0)?.to_vec1::<f32>()?;
                 let prefill_ms = t1.elapsed().as_secs_f64() * 1e3;
                 let prefill_tok_s = prefill as f64 / (prefill_ms / 1e3);
 

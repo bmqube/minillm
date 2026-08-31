@@ -51,16 +51,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Warm-up: triggers lazy allocation / kernel selection.
     let warm = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-    let _ = model
-        .forward(&warm)?
-        .i((0, ids.len() - 1))?
-        .to_vec1::<f32>()?;
+    let _ = model.forward_last(&warm)?.i(0)?.to_vec1::<f32>()?;
 
-    // Prefill (full forward pass over the prompt).
+    // Prefill: full forward pass over the prompt, only the final position's
+    // logits kept (via `forward_last`) — this is what a real decode session
+    // actually needs from prefill, same as `Generator::prefill`.
     let t1 = Instant::now();
     let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-    let logits = model.forward(&input)?;
-    let _ = logits.i((0, ids.len() - 1))?.to_vec1::<f32>()?; // force realisation
+    let logits = model.forward_last(&input)?;
+    let _ = logits.i(0)?.to_vec1::<f32>()?; // force realisation
     let prefill_s = t1.elapsed().as_secs_f64();
     println!(
         "prefill        : {:.1} ms ({:.1} tok/s)",

@@ -241,6 +241,9 @@ impl<'m> Generator<'m> {
 
     /// Run `ids` through the model in one pass, seeding the cache. Returns the
     /// logits for the position after the last prompt token.
+    ///
+    /// Uses [`GPT2Model::forward_with_cache_last`] so `lm_head` runs on just
+    /// that one position instead of the whole prompt.
     pub fn prefill(&mut self, ids: &[u32]) -> Result<&Tensor> {
         if ids.is_empty() {
             return Err(candle_core::Error::Msg(
@@ -248,17 +251,18 @@ impl<'m> Generator<'m> {
             ));
         }
         let input = Tensor::from_vec(ids.to_vec(), (1, ids.len()), &self.device)?;
-        let out = self.model.forward_with_cache(&input, &mut self.cache)?;
-        let last = out.dim(1)? - 1;
-        self.logits = Some(out.i((0, last))?);
+        let out = self
+            .model
+            .forward_with_cache_last(&input, &mut self.cache)?;
+        self.logits = Some(out.i(0)?);
         Ok(self.logits.as_ref().expect("just set"))
     }
 
     /// Feed one token and return the logits it produces.
     pub fn feed(&mut self, id: u32) -> Result<&Tensor> {
         let step = Tensor::from_vec(vec![id], (1, 1), &self.device)?;
-        let out = self.model.forward_with_cache(&step, &mut self.cache)?;
-        self.logits = Some(out.i((0, 0))?);
+        let out = self.model.forward_with_cache_last(&step, &mut self.cache)?;
+        self.logits = Some(out.i(0)?);
         Ok(self.logits.as_ref().expect("just set"))
     }
 
@@ -330,9 +334,10 @@ pub fn greedy(
 }
 
 /// Greedily generate `steps` tokens with **no** cache: every step re-runs the
-/// whole sequence through [`GPT2Model::forward`]. The O(n^2) reference path that
-/// [`greedy`] is measured against — and the oracle the cache is checked for
-/// equality with.
+/// whole sequence through [`GPT2Model::forward_last`]. The O(n^2) reference
+/// path that [`greedy`] is measured against — and the oracle the cache is
+/// checked for equality with. Uses `forward_last` rather than `forward` since
+/// only the final position's logits are ever consumed here.
 pub fn greedy_no_cache(
     model: &GPT2Model,
     device: &Device,
@@ -344,8 +349,8 @@ pub fn greedy_no_cache(
     for _ in 0..steps {
         let input = Tensor::from_vec(seq.clone(), (1, seq.len()), device)?;
         let row: Vec<f32> = model
-            .forward(&input)?
-            .i((0, seq.len() - 1))?
+            .forward_last(&input)?
+            .i(0)?
             .to_dtype(candle_core::DType::F32)?
             .to_vec1::<f32>()?;
         let next = argmax(&row) as u32;

@@ -1,5 +1,7 @@
 # MiniLLM
 
+[![CI](https://github.com/bmqube/minillm/actions/workflows/ci.yml/badge.svg)](https://github.com/bmqube/minillm/actions/workflows/ci.yml)
+
 A small GPT-2 inference engine written in Rust. It loads GPT-2 checkpoints from
 the HuggingFace Hub and runs autoregressive text generation on CPU or CUDA.
 
@@ -24,10 +26,11 @@ If you want to see the transformer built without a tensor framework, read the
   still matches HuggingFace to fp32 noise (see [benchmarks](benchmarks/)). The
   plain `forward` is kept as the reference and pre-cache baseline.
 - **Quantized KV cache.** `KvQuant::Int8` (per-token symmetric) is 3.76× smaller
-  for effectively no perplexity change (Δ ≈ +0.008 on WikiText-2), ~10–25% slower
-  decode. `KvQuant::Int4` (per-token asymmetric, packed) is 6.4× smaller for
-  ~+3.8% perplexity and a steeper decode penalty. Storage dequantizes to fp32 for
-  the matmul, so peak RSS is unchanged either way — see [benchmarks](benchmarks/).
+  for effectively no perplexity change (Δ ≈ +0.008 on WikiText-2) and ~3% slower
+  decode up to 128 tokens of context. `KvQuant::Int4` (per-token asymmetric,
+  packed) is 6.4× smaller for ~+3.8% perplexity and a 40–60% decode penalty.
+  Storage dequantizes to fp32 for the matmul, so peak RSS is unchanged either
+  way — see [benchmarks](benchmarks/).
 - Larger GPT-2 sizes (`gpt2-medium/large/xl`) share the architecture and should
   load, but only the 124M base model is regularly exercised.
 - Inference only — no training.
@@ -44,13 +47,13 @@ src/
 ├── transformers.rs TransformerBlock: pre-LN attention + MLP with residuals, cache-aware variant
 ├── attention.rs    MultiHeadAttention: fused QKV, scaled dot-product, full + incremental paths
 ├── activations.rs  tanh-approx GELU (matches GPT-2's gelu_new)
-├── generation.rs   SamplingConfig + sample(): greedy / temperature / top-k / top-p
+├── generation.rs   Generator (decode loop) + SamplingConfig / sample(): greedy / temp / top-k / top-p
 ├── kv_cache.rs     KvCache / LayerKvCache: per-layer K/V cache, fp32 or per-token int8 / int4
 └── device.rs       pick CUDA if built with --features cuda, else CPU
 
 src/bin/
 ├── bench.rs        throughput + size benchmark, no-cache vs KV-cache decode
-├── sweep.rs        seq-len throughput sweep (cache off/on, fp32/int8/int4) → CSV
+├── sweep.rs        seq-len sweep (cache off/on, fp32/int8/int4, --repeats N) → CSV
 ├── ppl.rs          sliding-window perplexity on a text file (--kv-quant off|int8|int4)
 ├── memprobe.rs     peak-RSS probe for one decode path (KV-cache memory cost)
 └── parity_dump.rs  dump logits for the parity check (--cache exercises the cache path)
@@ -59,7 +62,7 @@ examples/
 └── generate.rs     minimal library-usage example (KV-cache decode loop)
 
 tests/
-└── cache_parity.rs KV-cache output == full-recompute output (ignored; needs local weights)
+└── cache_parity.rs cache == full-recompute; quantized caches stay close (ignored; needs weights)
 
 benchmarks/         prompt set, parity script, methodology + results
 ```
@@ -105,30 +108,26 @@ of a fixed prompt, followed by a tok/s line on stderr.
 
 ### Library
 
+`Generator` owns the KV cache and drives the decode loop: prefill the prompt
+once, then take one token per step.
+
 ```rust
-use candle_core::Tensor;
-use minillm::generation::{sample, SamplingConfig};
-use minillm::kv_cache::KvCache;
+use minillm::generation::{Generator, SamplingConfig};
 use minillm::{device, loader};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dev = device::best();
     let (model, tokenizer) = loader::load("openai-community/gpt2", &dev)?;
 
-    let mut ids = tokenizer.encode("The future of AI is", true)?.get_ids().to_vec();
+    let ids = tokenizer.encode("The future of AI is", true)?.get_ids().to_vec();
     let cfg = SamplingConfig { temperature: 0.8, top_k: Some(40), top_p: Some(0.95) };
 
-    // Prefill the prompt, then decode one token per step against the cache.
-    let mut cache = KvCache::new(model.config().n_layer);
-    let prompt = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-    let mut logits = model.forward_with_cache(&prompt, &mut cache)?;
+    let mut generator = Generator::new(&model, &dev);
+    generator.prefill(&ids)?;
 
     for _ in 0..40 {
-        let next = sample(&logits, &cfg)?;
+        let next = generator.next_token(&cfg)?;
         print!("{}", tokenizer.decode(&[next], false)?);
-        ids.push(next);
-        let step = Tensor::from_vec(vec![next], (1, 1), &dev)?;
-        logits = model.forward_with_cache(&step, &mut cache)?;
     }
     Ok(())
 }
@@ -138,6 +137,26 @@ Run the same thing as an example:
 
 ```bash
 cargo run --release --example generate -- "Once upon a time"
+```
+
+Other entry points:
+
+| | |
+|---|---|
+| `Generator::with_quant(&model, &dev, KvQuant::Int8)` | quantized KV cache |
+| `generation::greedy(&model, &dev, &ids, n, quant)` | one-shot greedy decode |
+| `generation::greedy_no_cache(&model, &dev, &ids, n)` | the O(n²) reference path |
+| `generation::sample_with(&logits, &cfg, &mut rng)` | seeded, reproducible sampling |
+| `Generator::next_token_with(&cfg, &mut rng)` | same, inside the decode loop |
+
+Greedy decoding (`temperature <= 1e-6`, no `top_k`/`top_p`) consumes no
+randomness, so every benchmark in this repo is deterministic. For reproducible
+*sampled* output, pass a seeded RNG:
+
+```rust
+use rand::SeedableRng;
+let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+let next = generator.next_token_with(&cfg, &mut rng)?;
 ```
 
 ### Sampling options
@@ -199,12 +218,20 @@ KV-cache-byte counts, and the `KvCache` container (append grows the sequence
 axis, `reset`, length tracking, int8/int4 round-trip error bounds). These do not
 require downloading a model.
 
-The end-to-end KV-cache check needs GPT-2 weights in `benchmarks/gpt2/` and is
+The end-to-end KV-cache checks need GPT-2 weights in `benchmarks/gpt2/` and are
 `#[ignore]`d by default:
 
 ```bash
 cargo test --test cache_parity -- --ignored
 ```
+
+`cache_matches_no_cache` asserts that greedy decoding with the cache produces the
+exact same token ids as the full-recompute `forward`; `quantized_caches_stay_close_to_fp32`
+bounds how far int8/int4 prefill logits drift, and that int8 stays closer than int4.
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `cargo fmt --check`,
+`cargo clippy --all-targets -D warnings`, the test suite and `cargo doc` on every
+push and PR.
 
 It asserts that greedy decoding with the cache produces the exact same token ids
 as the full-recompute `forward`.

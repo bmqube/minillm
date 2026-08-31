@@ -2,9 +2,14 @@
 
 Reproducible throughput, memory and correctness checks for MiniLLM.
 
-Everything here is deterministic given a set of weights and the fixed prompt set
-in [`prompts.txt`](prompts.txt). Re-run after any change to the model or
-generation code and update the tables below.
+Every benchmark here decodes **greedily**, which consumes no randomness, so the
+outputs are bit-deterministic given the weights (hashes below) and the fixed
+prompt set in [`prompts.txt`](prompts.txt). Only *timings* vary between runs —
+see the note on repeats in §4. For reproducible *sampled* generation, use
+`generation::sample_with` / `Generator::next_token_with` with a seeded RNG.
+
+Re-run after any change to the model or generation code and update the tables
+below.
 
 ## 0. Get the weights (once)
 
@@ -20,6 +25,19 @@ for f in config.json tokenizer.json model.safetensors; do curl -sL -o "$f" "$bas
 
 The binaries also accept a Hub id (`openai-community/gpt2`) instead of the
 directory, if you'd rather use the HF cache.
+
+Verify you have the same bytes every result below was produced from:
+
+```bash
+sha256sum benchmarks/gpt2/*            # or: shasum -a 256 / Get-FileHash -Algorithm SHA256
+```
+
+| file | SHA-256 |
+|---|---|
+| `config.json` | `0daed7749b4f02b8f76240d5444551d7b08712dab4d0adb8239c56ba823bb7b4` |
+| `tokenizer.json` | `8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6` |
+| `model.safetensors` | `248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707` |
+| `wikitext2.txt` (§5) | `bbf94c53a05abe9ee670d3b6343608095822c85e26de37c70b24fc571964574a` |
 
 ## 1. Throughput and size
 
@@ -147,19 +165,23 @@ row's `kv_quant` (§6); `kv_quant` is `none` on `off` rows.
 Same environment as §1. 32 greedy decode steps after each prefill;
 `benchmarks/sweep_cpu.csv` has the raw rows.
 
+Mean ± sample std over **5 trials** per configuration (`--repeats 5`);
+`benchmarks/sweep_cpu.csv` has all 100 individual trials.
+
 | seq start | decode tok/s, no cache | decode tok/s, KV cache | speedup |
 |---|---|---|---|
-| 16 | 9.5 | 41.3 | 4.3× |
-| 64 | 4.6 | 38.5 | 8.3× |
-| 128 | 2.7 | 38.0 | 14.1× |
-| 256 | 1.4 | 29.8 | 21.1× |
-| 512 | 0.7 | 21.2 | 30.2× |
+| 16  | 11.76 ± 0.28 | 53.05 ± 1.08 | 4.5× |
+| 64  | 5.19 ± 0.05 | 49.95 ± 0.60 | 9.6× |
+| 128 | 2.96 ± 0.09 | 45.41 ± 1.36 | 15.3× |
+| 256 | 1.64 ± 0.01 | 40.91 ± 1.34 | 24.9× |
+| 512 | 0.80 ± 0.01 | 25.83 ± 0.14 | 32.3× |
 
 No-cache decode ~halves per doubling of the sequence (O(n²)); the cached path
 degrades gently (growing K/V matmul + the per-step `cat` copy), so the speedup
-widens with context length. Absolute tok/s vary ±15–20% run to run on a loaded
-CPU — the ratios and the shape are what's stable; proper error bars over repeats
-are future work.
+widens with context length.
+
+Run-to-run spread is 0.4–4% on an otherwise-idle box but can exceed 10% under
+load, so single-trial numbers are not trustworthy — always pass `--repeats`.
 
 ## 5. Perplexity (`ppl`)
 
@@ -289,28 +311,46 @@ scheme with no full-precision residual for recent tokens.
 
 ### Speed — decode tok/s, `gpt2` 124M / CPU, 32 steps (`benchmarks/sweep_cpu.csv`)
 
+Mean ± std over 5 trials, same runs as §4.
+
 | seq start | fp32 | int8 | int4 |
 |---|---|---|---|
-| 16  | 41.3 | 42.0 (1.02×) | 38.3 (0.93×) |
-| 64  | 38.5 | 42.8 (1.11×) | 28.3 (0.73×) |
-| 128 | 38.0 | 33.4 (0.88×) | 21.7 (0.57×) |
-| 256 | 29.8 | 26.8 (0.90×) | 14.1 (0.47×) |
-| 512 | 21.2 | 16.2 (0.76×) | 7.9 (0.37×) |
+| 16  | 53.05 ± 1.08 | 51.69 ± 0.55 (0.97×) | 43.35 ± 0.17 (0.82×) |
+| 64  | 49.95 ± 0.60 | 48.54 ± 0.36 (0.97×) | 33.89 ± 0.85 (0.68×) |
+| 128 | 45.41 ± 1.36 | 44.23 ± 1.35 (0.97×) | 26.38 ± 0.22 (0.58×) |
+| 256 | 40.91 ± 1.34 | 37.70 ± 1.49 (0.92×) | 17.13 ± 1.96 (0.42×) |
+| 512 | 25.83 ± 0.14 | 19.90 ± 0.13 (0.77×) | 9.64 ± 0.21 (0.37×) |
 
-(int8 ≥ fp32 at short sequences is within run-to-run noise; §4.) Both quantized
-paths are pure overhead on a matmul that stays fp32, and the penalty grows with
-cache length; int4's nibble pack/unpack is heavier than int8's cast. Both still
-beat the no-cache rate (0.7–9.5 tok/s over this range) by a wide margin.
+int8 costs ~3% up to 128 tokens and 23% by 512; int4 starts at ~18% and reaches
+63%. Both still beat the no-cache rate (0.8–11.8 tok/s over this range) by a wide
+margin.
+
+> **Why the quantized paths get slower with context — read this before citing the
+> speed numbers.** Two properties of `LayerKvCache` drive them, and both are
+> implementation choices, not properties of low-bit KV:
+>
+> 1. `append` grows the cache with `Tensor::cat`, copying the whole cache every
+>    decode step. Applies to fp32 too, and is why even the fp32 cached path
+>    decays with length.
+> 2. Quantized modes **dequantize the entire cache to fp32 every step** so the
+>    attention matmul stays fp32 — a second O(n) pass per step, heavier for int4
+>    (nibble unpack) than int8 (byte cast).
+>
+> So these numbers bound how a *naive* low-bit KV path performs, not how int4
+> must perform. A preallocated write-in-place buffer removes (1); a low-precision
+> matmul or chunked dequant removes (2) and would also turn the retained-memory
+> saving into a peak-RSS saving.
 
 ### The frontier
 
-| mode | Δppl (8k) | retained KV | decode @ seq 128 |
+| mode | Δppl (60k) | retained KV | decode @ seq 128 |
 |---|---|---|---|
-| fp32 | — | 72 KiB/tok | 38.0 tok/s |
-| **int8** | +0.002 | 19 KiB/tok (3.8×) | 33.4 tok/s (0.88×) |
-| **int4** | +1.20 | 11 KiB/tok (6.4×) | 21.7 tok/s (0.57×) |
+| fp32 | — | 72 KiB/tok | 45.41 ± 1.36 tok/s |
+| **int8** | +0.008 (+0.03%) | 19 KiB/tok (3.8×) | 44.23 ± 1.35 (0.97×) |
+| **int4** | +1.13 (+3.8%) | 11 KiB/tok (6.4×) | 26.38 ± 0.22 (0.58×) |
 
-int8 is a near-free 3.8× memory cut; int4 buys another 1.7× compression for a
-real ~3.6% perplexity cost and a steeper decode penalty. Realising the memory
-saving as lower *peak* RSS, and recovering the speed, both need the attention
-matmul itself to run at low precision.
+int8 is essentially a free 3.8× memory cut — the quality change is at fp32-noise
+level and the speed cost is inside the error bars at this context length. int4
+buys another 1.7× compression for a real ~3.8% perplexity cost *and* a 42% speed
+cost. Realising the memory saving as lower *peak* RSS, and recovering the speed,
+both need the attention matmul itself to run at low precision.

@@ -29,7 +29,14 @@ pub struct Qwen3Attention {
     n_kv_head: usize,
     n_kv_groups: usize,
     head_dim: usize,
-    hidden_size: usize,
+    /// `n_head * head_dim` — the width of the concatenated head output, and the
+    /// input width of `o_proj`.
+    ///
+    /// Deliberately **not** `hidden_size`. Qwen3 sets `head_dim` independently,
+    /// so on Qwen3-0.6B the heads concatenate to 16 * 128 = 2048 while the
+    /// residual stream is 1024, and `o_proj` is the 2048 -> 1024 projection that
+    /// reconciles them.
+    q_out: usize,
 }
 
 impl Qwen3Attention {
@@ -73,7 +80,7 @@ impl Qwen3Attention {
             n_kv_head: cfg.num_key_value_heads,
             n_kv_groups: cfg.n_kv_groups(),
             head_dim,
-            hidden_size: hidden,
+            q_out,
         })
     }
 
@@ -140,8 +147,11 @@ impl Qwen3Attention {
         let weights = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = weights.matmul(&v.contiguous()?)?;
 
+        // [b, n_head, q, head_dim] -> [b, q, n_head * head_dim]. The width is
+        // `q_out`, not `hidden_size`; see the field's doc comment.
         out.transpose(1, 2)?
-            .reshape((batch, q_len, self.hidden_size))?
+            .contiguous()?
+            .reshape((batch, q_len, self.q_out))?
             .apply(&self.o_proj)
     }
 

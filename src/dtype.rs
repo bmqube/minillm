@@ -5,7 +5,7 @@
 //! bf16 weights and are far too large to hold at fp32 — Qwen3-8B is ~16 GiB at
 //! bf16 and ~32 GiB at fp32 — so loading those needs an explicit precision.
 
-use candle_core::DType;
+use candle_core::{DType, Device};
 
 /// Weight / activation precision for a loaded model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,6 +68,34 @@ impl Precision {
             _ => None,
         }
     }
+
+    /// Whether candle can run a matmul at this precision on `device`.
+    ///
+    /// candle's CPU gemm has no bf16 kernel — a bf16 model loads fine and then
+    /// fails on the first attention matmul with "unsupported dtype BF16 for op
+    /// matmul", after the weights are already resident. CUDA does bf16 through
+    /// cuBLAS, so the same checkpoint is fine on a GPU.
+    pub fn is_supported_on(self, device: &Device) -> bool {
+        match self {
+            Self::F32 | Self::F16 => true,
+            Self::BF16 => !device.is_cpu(),
+        }
+    }
+
+    /// This precision if `device` supports it, otherwise the widest one that
+    /// always works.
+    ///
+    /// Falls back to fp32 rather than fp16: fp16 has bf16's mantissa but a much
+    /// narrower exponent range, so silently substituting it for a bf16-trained
+    /// checkpoint risks overflowing activations. fp32 is the safe superset, and
+    /// it is what every existing benchmark in this repo already uses.
+    pub fn resolve_for(self, device: &Device) -> Self {
+        if self.is_supported_on(device) {
+            self
+        } else {
+            Self::F32
+        }
+    }
 }
 
 impl std::fmt::Display for Precision {
@@ -107,5 +135,24 @@ mod tests {
     #[test]
     fn default_is_f32_so_existing_benchmarks_reproduce() {
         assert_eq!(Precision::default(), Precision::F32);
+    }
+
+    #[test]
+    fn bf16_is_not_runnable_on_cpu() {
+        // candle has no CPU bf16 gemm; this is what stops a bf16 checkpoint from
+        // loading fine and then dying inside the first attention matmul.
+        let cpu = Device::Cpu;
+        assert!(!Precision::BF16.is_supported_on(&cpu));
+        assert!(Precision::F32.is_supported_on(&cpu));
+        assert!(Precision::F16.is_supported_on(&cpu));
+    }
+
+    #[test]
+    fn cpu_fallback_is_f32_not_f16() {
+        let cpu = Device::Cpu;
+        assert_eq!(Precision::BF16.resolve_for(&cpu), Precision::F32);
+        // Supported precisions are left alone.
+        assert_eq!(Precision::F16.resolve_for(&cpu), Precision::F16);
+        assert_eq!(Precision::F32.resolve_for(&cpu), Precision::F32);
     }
 }

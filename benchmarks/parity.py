@@ -49,7 +49,7 @@ def main():
     try:
         import numpy as np
         import torch
-        from transformers import GPT2LMHeadModel
+        from transformers import AutoConfig, AutoModelForCausalLM
     except ImportError as exc:  # pragma: no cover
         sys.exit(f"missing dependency: {exc}\n  pip install numpy torch transformers")
 
@@ -57,12 +57,16 @@ def main():
 
     model_id = data.get("model", "benchmarks/gpt2")
     is_local = os.path.isdir(model_id)
+    arch = AutoConfig.from_pretrained(model_id, local_files_only=is_local).model_type
     print(
         f"reference: {model_id} "
-        f"({'local files' if is_local else 'HuggingFace Hub'}, Transformers)"
+        f"({'local files' if is_local else 'HuggingFace Hub'}, Transformers, {arch})"
     )
-    model = GPT2LMHeadModel.from_pretrained(
-        model_id, local_files_only=is_local
+    # Load in fp32 regardless of the checkpoint's own dtype: the comparison is
+    # against MiniLLM's fp32 CPU path, and a bf16 reference would put the
+    # reference's own rounding error inside the thresholds below.
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, local_files_only=is_local, dtype=torch.float32
     ).eval()
 
     header = (

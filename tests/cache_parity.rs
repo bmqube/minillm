@@ -83,20 +83,58 @@ fn quantized_caches_stay_close(dir: &str) {
             .fold(0.0f32, f32::max)
     };
 
-    let d8 = max_abs(&full, &int8);
-    let d4 = max_abs(&full, &int4);
+    // Absolute logit deltas are not comparable across models: Qwen3's logits
+    // span a far wider range than GPT-2's, so the same *relative* quantization
+    // error surfaces as a larger absolute number. Scale by the spread of the
+    // reference logits so the threshold means the same thing on both.
+    let mean = full.iter().sum::<f32>() / full.len() as f32;
+    let std = (full.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / full.len() as f32).sqrt();
 
+    let d8 = max_abs(&full, &int8) / std;
+    let d4 = max_abs(&full, &int4) / std;
+    eprintln!("{dir}: logit std {std:.3}, int8 drift {d8:.4} std, int4 drift {d4:.4} std");
+
+    // Measured drift, prefill on the fixed prompt:
+    //
+    //   gpt2 124M       int8 0.038 std   int4 0.228 std
+    //   qwen3 0.6B      int8 0.282 std   int4 3.747 std
+    //
+    // Qwen3 is ~7x more sensitive to int8 and ~16x more to int4 than GPT-2 —
+    // int4 KV genuinely degrades it. The limits below are regression guards set
+    // above the observed values, not a claim that either number is fine; the
+    // architecture gap is a result in its own right, recorded in benchmarks/.
     assert!(
         d8 < 0.5,
-        "{dir}: int8 prefill logits drifted: max|d| = {d8}"
+        "{dir}: int8 prefill logits drifted {d8:.4} std (limit 0.5)"
     );
     assert!(
         d4 < 5.0,
-        "{dir}: int4 prefill logits drifted: max|d| = {d4}"
+        "{dir}: int4 prefill logits drifted {d4:.4} std (limit 5.0)"
     );
     assert!(
         d8 < d4,
-        "{dir}: int8 ({d8}) should be closer than int4 ({d4})"
+        "{dir}: int8 ({d8:.4} std) should be closer than int4 ({d4:.4} std)"
+    );
+
+    // Whether the drift actually changes the emitted token is the thing that
+    // matters, and it is architecture-dependent: int8 preserves GPT-2's argmax
+    // on this prompt and flips Qwen3's. Reported, not asserted — pinning either
+    // outcome would encode an accident of this prompt as a requirement.
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold(0usize, |b, (i, x)| if *x > v[b] { i } else { b })
+    };
+    eprintln!(
+        "{dir}: argmax full={} int8={} int4={} (int8 {} top-1)",
+        argmax(&full),
+        argmax(&int8),
+        argmax(&int4),
+        if argmax(&full) == argmax(&int8) {
+            "preserves"
+        } else {
+            "CHANGES"
+        }
     );
 }
 

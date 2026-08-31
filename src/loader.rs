@@ -232,9 +232,36 @@ pub fn load_files(
 ) -> Result<(Box<dyn CausalLM>, Tokenizer), BoxErr> {
     let probe = probe(&files.config)?;
     let architecture = probe.architecture()?;
-    let precision = precision
-        .or_else(|| probe.torch_dtype.as_deref().and_then(Precision::parse))
-        .unwrap_or_default();
+
+    // An explicit request is honoured or refused; an inferred one adapts. Failing
+    // here rather than inside the first matmul matters: by then several GiB of
+    // weights are already resident and the error names an op, not a fix.
+    let precision = match precision {
+        Some(p) if !p.is_supported_on(device) => {
+            return Err(format!(
+                "{p} is not supported on {device:?} (candle has no CPU bf16 gemm). \
+                 Re-run with f32, or use a CUDA device."
+            )
+            .into())
+        }
+        Some(p) => p,
+        None => {
+            let inferred = probe
+                .torch_dtype
+                .as_deref()
+                .and_then(Precision::parse)
+                .unwrap_or_default();
+            let resolved = inferred.resolve_for(device);
+            if resolved != inferred {
+                eprintln!(
+                    "note: checkpoint is {inferred}, which {device:?} cannot run; \
+                     loading at {resolved} instead ({}x the weight memory)",
+                    resolved.size_in_bytes() / inferred.size_in_bytes()
+                );
+            }
+            resolved
+        }
+    };
 
     let tokenizer = Tokenizer::from_file(&files.tokenizer)?;
     let json = std::fs::read_to_string(&files.config)?;

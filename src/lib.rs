@@ -3,6 +3,7 @@ pub mod attention;
 pub mod config;
 pub mod device;
 pub mod generation;
+pub mod kv_cache;
 pub mod loader;
 pub mod model;
 pub mod transformers;

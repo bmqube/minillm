@@ -1,4 +1,5 @@
 use crate::config::GPT2Config;
+use crate::kv_cache::LayerKvCache;
 use crate::{activations::gelu, attention::MultiHeadAttention};
 use candle_core::{Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
@@ -41,18 +42,35 @@ impl TransformerBlock {
         })
     }
 
+    /// Position-wise feed-forward: `c_fc` -> gelu -> `c_proj`.
+    fn mlp(&self, x: &Tensor) -> Result<Tensor> {
+        let h = x.apply(&self.mlp_c_fc)?;
+        let h = gelu(&h)?;
+        h.apply(&self.mlp_c_proj)
+    }
+
+    /// Full-sequence pre-LN block: attention + MLP, each with a residual.
     pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        // Self-attention with residual connection
-        let ln1_out = x.apply(&self.ln_1)?;
-        let attn_out = self.attn.forward(&ln1_out, mask)?;
+        let attn_out = self.attn.forward(&x.apply(&self.ln_1)?, mask)?;
         let x = (x + attn_out)?;
+        let mlp_out = self.mlp(&x.apply(&self.ln_2)?)?;
+        x + mlp_out
+    }
 
-        // MLP with residual connection
-        let ln2_out = x.apply(&self.ln_2)?;
-        let mlp_out = ln2_out.apply(&self.mlp_c_fc)?;
-        let mlp_out = gelu(&mlp_out)?;
-        let mlp_out = mlp_out.apply(&self.mlp_c_proj)?;
-
+    /// Incremental block: the attention step reads and extends `cache`; the MLP
+    /// runs on the new positions only. See
+    /// [`MultiHeadAttention::forward_with_cache`].
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut LayerKvCache,
+    ) -> Result<Tensor> {
+        let attn_out = self
+            .attn
+            .forward_with_cache(&x.apply(&self.ln_1)?, mask, cache)?;
+        let x = (x + attn_out)?;
+        let mlp_out = self.mlp(&x.apply(&self.ln_2)?)?;
         x + mlp_out
     }
 }

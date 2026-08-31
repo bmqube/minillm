@@ -2,6 +2,7 @@ use candle_core::{IndexOp, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
 
 use crate::config::GPT2Config;
+use crate::kv_cache::LayerKvCache;
 
 pub struct MultiHeadAttention {
     c_attn: Linear, // Combined Q, K, V projection
@@ -32,43 +33,72 @@ impl MultiHeadAttention {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    /// Project `x` (`[batch, seq, n_embd]`) into per-head Q, K, V, each shaped
+    /// `[batch, n_head, seq, head_dim]`.
+    fn project_qkv(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (batch_size, seq_len, _) = x.dims3()?;
+        let head_dim = self.n_embd / self.n_head;
 
-        // Combined QKV projection
         let qkv = x.apply(&self.c_attn)?;
-        let qkv = qkv.reshape((
-            batch_size,
-            seq_len,
-            3,
-            self.n_head,
-            self.n_embd / self.n_head,
-        ))?;
+        let qkv = qkv.reshape((batch_size, seq_len, 3, self.n_head, head_dim))?;
 
-        // Split and transpose for attention
-        let q = qkv.i((.., .., 0, .., ..))?.transpose(1, 2)?.contiguous()?; // [batch, heads, seq, head_dim]
+        // [batch, heads, seq, head_dim]
+        let q = qkv.i((.., .., 0, .., ..))?.transpose(1, 2)?.contiguous()?;
         let k = qkv.i((.., .., 1, .., ..))?.transpose(1, 2)?.contiguous()?;
         let v = qkv.i((.., .., 2, .., ..))?.transpose(1, 2)?.contiguous()?;
+        Ok((q, k, v))
+    }
 
-        // Scaled dot-product attention
-        let head_dim = self.n_embd / self.n_head;
+    /// Scaled dot-product attention. `q` is `[batch, n_head, q_len, head_dim]`,
+    /// `k`/`v` are `[batch, n_head, kv_len, head_dim]`, and the optional additive
+    /// `mask` is `[q_len, kv_len]`. Returns `[batch, q_len, n_embd]` after the
+    /// output projection.
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (batch_size, _, q_len, head_dim) = q.dims4()?;
         let scale = 1.0 / (head_dim as f64).sqrt();
 
         let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
         let mut scores = (scores * scale)?;
 
-        // Apply causal mask
         if let Some(mask) = mask {
             scores = scores.broadcast_add(mask)?;
         }
 
         let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = attn_weights.matmul(&v)?;
+        let out = attn_weights.matmul(v)?;
 
-        // Concatenate heads and project
+        // Concatenate heads and project.
         let out = out
             .transpose(1, 2)?
-            .reshape((batch_size, seq_len, self.n_embd))?;
+            .reshape((batch_size, q_len, self.n_embd))?;
         out.apply(&self.c_proj)
+    }
+
+    /// Full-sequence attention: every position attends over the whole input.
+    pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let (q, k, v) = self.project_qkv(x)?;
+        self.attend(&q, &k, &v, mask)
+    }
+
+    /// Incremental attention. `x` holds only the new tokens
+    /// (`[batch, new_seq, n_embd]`); their K/V are appended to `cache` and the
+    /// new queries attend over the full cached history. `mask` is
+    /// `[new_seq, past + new_seq]`, or `None` for a single-token decode step
+    /// (the lone new query may attend to everything).
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut LayerKvCache,
+    ) -> Result<Tensor> {
+        let (q, k_new, v_new) = self.project_qkv(x)?;
+        let (k, v) = cache.append(&k_new, &v_new)?;
+        self.attend(&q, &k, &v, mask)
     }
 }

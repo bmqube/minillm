@@ -1,4 +1,5 @@
 use crate::config::GPT2Config;
+use crate::kv_cache::KvCache;
 use crate::transformers::TransformerBlock;
 use candle_core::{Device, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
@@ -52,44 +53,94 @@ impl GPT2Model {
         })
     }
 
+    /// Full-sequence forward pass. Every call recomputes attention over the whole
+    /// input; use [`forward_with_cache`](Self::forward_with_cache) for
+    /// autoregressive decoding.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
 
-        // Create position IDs
         let positions = Tensor::arange(0, seq_len as i64, input_ids.device())?
             .unsqueeze(0)?
             .expand((batch_size, seq_len))?;
 
-        // Embeddings
         let tok_emb = input_ids.apply(&self.wte)?;
         let pos_emb = positions.apply(&self.wpe)?;
         let mut hidden_states = (tok_emb + pos_emb)?;
 
-        // Create causal mask
-        let mask = create_causal_mask(seq_len, input_ids.device())?;
+        let mask = causal_mask(seq_len, seq_len, 0, input_ids.device())?;
 
-        // Transformer blocks
         for block in &self.blocks {
             hidden_states = block.forward(&hidden_states, Some(&mask))?;
         }
 
-        // Final layer norm and projection
         let hidden_states = hidden_states.apply(&self.ln_f)?;
+        hidden_states.apply(&self.lm_head)
+    }
 
+    /// Incremental forward pass over `input_ids` (the **new** tokens only),
+    /// reading and extending `cache`. Returns logits for those new positions,
+    /// `[batch, new_seq, vocab]`.
+    ///
+    /// Pass the full prompt on the first call (prefill) and one token per step
+    /// afterwards. Position ids are offset by the cache length so `wpe` stays
+    /// correct; a single-token step needs no attention mask, a multi-token step
+    /// gets an offset causal mask. With an empty cache and the full sequence this
+    /// computes exactly what [`forward`](Self::forward) does.
+    pub fn forward_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
+        let (batch_size, seq_len) = input_ids.dims2()?;
+        let past = cache.len();
+        let total = past + seq_len;
+        if total > self.cfg.n_ctx {
+            return Err(candle_core::Error::Msg(format!(
+                "sequence length {total} exceeds GPT-2 context window {}",
+                self.cfg.n_ctx
+            )));
+        }
+        if cache.n_layer() != self.blocks.len() {
+            return Err(candle_core::Error::Msg(format!(
+                "cache has {} layers, model has {}",
+                cache.n_layer(),
+                self.blocks.len()
+            )));
+        }
+
+        let positions = Tensor::arange(past as i64, total as i64, input_ids.device())?
+            .unsqueeze(0)?
+            .expand((batch_size, seq_len))?;
+
+        let tok_emb = input_ids.apply(&self.wte)?;
+        let pos_emb = positions.apply(&self.wpe)?;
+        let mut hidden_states = (tok_emb + pos_emb)?;
+
+        let mask = if seq_len == 1 {
+            None
+        } else {
+            Some(causal_mask(seq_len, total, past, input_ids.device())?)
+        };
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            hidden_states =
+                block.forward_with_cache(&hidden_states, mask.as_ref(), cache.layer(i))?;
+        }
+
+        let hidden_states = hidden_states.apply(&self.ln_f)?;
         hidden_states.apply(&self.lm_head)
     }
 }
 
-fn create_causal_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
-    let mut mask_data = vec![0.0f32; seq_len * seq_len];
-
-    for i in 0..seq_len {
-        for j in 0..seq_len {
-            if j > i {
-                mask_data[i * seq_len + j] = -1e10f32; // Mask future positions
-            }
+/// Additive attention mask, `[q_len, kv_len]`: `0` where a query position may
+/// attend to a key position and `-1e10` where it may not.
+///
+/// Query row `i` is the token at absolute position `past + i` and may attend to
+/// key columns `0..=past + i`. With `past == 0` and `q_len == kv_len` this is the
+/// plain lower-triangular causal mask.
+fn causal_mask(q_len: usize, kv_len: usize, past: usize, device: &Device) -> Result<Tensor> {
+    let mut data = vec![0.0f32; q_len * kv_len];
+    for i in 0..q_len {
+        let allowed = past + i; // last key column this query may see
+        for j in (allowed + 1)..kv_len {
+            data[i * kv_len + j] = -1e10f32;
         }
     }
-
-    Tensor::from_vec(mask_data, (seq_len, seq_len), device)
+    Tensor::from_vec(data, (q_len, kv_len), device)
 }

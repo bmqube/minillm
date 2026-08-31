@@ -47,6 +47,7 @@ src/bin/
 ├── bench.rs        throughput + size benchmark, no-cache vs KV-cache decode
 ├── sweep.rs        seq-len × model-size throughput sweep (cache on/off) → CSV
 ├── ppl.rs          sliding-window perplexity on a text file
+├── memprobe.rs     peak-RSS probe for one decode path (KV-cache memory cost)
 └── parity_dump.rs  dump logits for the parity check (--cache exercises the cache path)
 
 examples/

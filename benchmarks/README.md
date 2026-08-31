@@ -138,7 +138,8 @@ cargo run --release --bin sweep -- benchmarks/gpt2 16,64,128,256,512 32 both > b
 # args: MODELS(comma-sep dirs/ids)  PREFILLS(comma-sep)  DECODE(steps)  CACHE(off|on|both)
 ```
 
-Columns: `model,params,device,dtype,kv_cache,prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,prefill_tok_s,decode_tok_s,decode_s`.
+Columns: `model,params,kv_bytes_per_token,device,dtype,kv_cache,prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,prefill_tok_s,decode_tok_s,decode_s`.
+`kv_bytes_per_token` is the analytic fp32 cache cost per position (§6).
 
 ### Results — `openai-community/gpt2` (124M), fp32, CPU
 
@@ -147,11 +148,11 @@ Same environment as §1. 32 greedy decode steps after each prefill;
 
 | seq start | decode tok/s, no cache | decode tok/s, KV cache | speedup |
 |---|---|---|---|
-| 16 | 11.1 | 52.5 | 4.7× |
-| 64 | 5.2 | 50.2 | 9.6× |
-| 128 | 3.0 | 45.9 | 15.2× |
-| 256 | 1.6 | 38.4 | 23.5× |
-| 512 | 0.8 | 26.0 | 32.5× |
+| 16 | 11.2 | 53.5 | 4.8× |
+| 64 | 5.2 | 49.9 | 9.5× |
+| 128 | 3.0 | 46.4 | 15.5× |
+| 256 | 1.6 | 38.2 | 23.6× |
+| 512 | 0.8 | 26.5 | 32.9× |
 
 No-cache decode ~halves per doubling of the sequence (O(n²)); the cached path
 degrades gently (growing K/V matmul + the per-step `cat` copy), so the speedup
@@ -205,3 +206,39 @@ The first ~8k tokens of the test split are short biographical stubs and score
 high; over 60k it settles to ~29.9, in line with the usual "GPT-2 small ≈ 29" on
 WikiText-2. The KV-cache-quant ablation reports Δperplexity against this same
 fp32 baseline at a fixed `MAX_TOKENS`.
+
+## 6. KV-cache memory (`memprobe`)
+
+**Analytic** cost per cached position: `2 (K + V) * n_layer * n_embd * dtype_bytes`
+(`GPT2Config::kv_cache_bytes_per_token`). For `gpt2` 124M:
+
+| dtype | bytes/token | full 1024-ctx cache |
+|---|---|---|
+| fp32 | 73,728 (72 KiB) | 72 MiB |
+| int8 *(planned)* | 18,432 (18 KiB) | 18 MiB |
+| int4 *(planned)* | 9,216 (9 KiB) | 9 MiB |
+
+(int8/int4 add a fixed per-head fp32 scale table — `2 * n_layer * n_head * 4` ≈
+1 KiB total for `gpt2` 124M — not a per-token cost.)
+
+**Measured** peak RSS, one decode path per process, `decode = 32`:
+
+```bash
+cargo run --release --bin memprobe -- off 992 32     # full-recompute path
+cargo run --release --bin memprobe -- on  992 32     # KV-cache path
+```
+
+| seq end | analytic KV | peak RSS, no cache | peak RSS, KV cache | Δ |
+|---|---|---|---|---|
+| 128 | 9 MiB | 977.2 MiB | 977.2 MiB | ~0 |
+| 512 | 36 MiB | 977.2 MiB | 977.2 MiB | ~0 |
+| 1024 | 72 MiB | 977.2 MiB | 977.2 MiB | ~0 |
+
+On this config the KV-cache delta is below measurement noise (±~40 KB): the cache
+(≤72 MiB at full context) is smaller than the activation transient a single
+prefill forward already allocates — `[1, seq, vocab]` fp32 logits alone are
+~200 MiB at seq 1024 — so peak RSS stays pinned at the ~977 MiB floor set by
+weights + that transient. The analytic bytes/token is the metric that moves; the
+measurement's job is to confirm nothing hidden (e.g. a `cat` that keeps old
+buffers alive) inflates it. This is expected to change once model size grows or
+the cache is the dominant allocation.

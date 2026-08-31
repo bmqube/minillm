@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("cache        : {cache_arg}");
 
     println!(
-        "model,params,device,dtype,kv_cache,prefill_tokens,decode_steps,\
+        "model,params,kv_bytes_per_token,device,dtype,kv_cache,prefill_tokens,decode_steps,\
          seq_start,seq_end,load_s,prefill_ms,prefill_tok_s,decode_tok_s,decode_s"
     );
 
@@ -64,7 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let load_s = t0.elapsed().as_secs_f64();
         let params = model.config().num_parameters();
-        eprintln!("  loaded in {load_s:.2} s, {params} params");
+        let kv_bpt = model.config().kv_cache_bytes_per_token(4); // fp32 cache
+        eprintln!("  loaded in {load_s:.2} s, {params} params, KV {kv_bpt} B/token");
 
         for &prefill in &prefills {
             if prefill < 1 {
@@ -88,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let emit = |kv: &str, decode_tok_s: f64, decode_s: f64| {
                 println!(
-                    "{model_id},{params},{dev_str},f32,{kv},{prefill},{decode},\
+                    "{model_id},{params},{kv_bpt},{dev_str},f32,{kv},{prefill},{decode},\
                      {prefill},{},{load_s:.3},{prefill_ms:.1},\
                      {prefill_tok_s:.2},{decode_tok_s:.3},{decode_s:.3}",
                     prefill + decode

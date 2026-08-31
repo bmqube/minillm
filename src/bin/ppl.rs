@@ -27,10 +27,17 @@
 //! Auto-discovered by cargo as the `ppl` binary (like `bench` / `parity_dump`),
 //! so no `[[bin]]` entry in `Cargo.toml` is needed.
 //!
-//! Sanity: fp32 `openai-community/gpt2` (124M) on the WikiText-2 raw test split
-//! with `WINDOW = 512`, `STRIDE = 256` gives perplexity ~29-30. A wildly
-//! different value means the harness is wrong (windowing, off-by-one on targets,
-//! or stray special tokens).
+//! Correctness is checked against HuggingFace Transformers by
+//! `benchmarks/ppl_ref.py`, which runs this exact windowing scheme on the same
+//! text file: the two agree to fp32 noise (mean NLL within ~1e-4).
+//!
+//! fp32 `openai-community/gpt2` (124M) on WikiText-2 raw test, `WINDOW = 512`,
+//! `STRIDE = 256`: perplexity ~33.5 over the first 8k tokens (the test split
+//! opens with short biographical stubs), settling to ~29.9 over the first 60k —
+//! in line with the usual "GPT-2 small ≈ 29" figure. A wildly different value
+//! means the harness is wrong (windowing, off-by-one on targets, stray special
+//! tokens). For the KV-cache-quant ablation what is reported is Δperplexity
+//! against this same fp32 baseline at a fixed `MAX_TOKENS`.
 
 use candle_core::{DType, IndexOp, Tensor};
 use minillm::{device, loader};

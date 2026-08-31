@@ -159,19 +159,49 @@ widens with context length.
 
 ## 5. Perplexity (`ppl`)
 
-Sliding-window LM perplexity, for the KV-cache-quantization ablation (quality
-axis). Each target token is scored once, by the window with the most left
-context; NLL is `logsumexp(row) - row[target]`, accumulated on the CPU.
+Sliding-window LM perplexity, the quality axis for the KV-cache-quantization
+ablation. Each target token is scored exactly once, by the window with the most
+left context; NLL is `logsumexp(row) - row[target]`, accumulated on the CPU.
 
 ```bash
-# one-time: fetch WikiText-2 raw test into one file
-#   dataset: https://huggingface.co/datasets/Salesforce/wikitext (wikitext-2-raw-v1, test split)
-#   concatenate the 'text' column into benchmarks/wikitext2.txt  (git-ignored)
+# one-time: fetch the WikiText-2 raw test split into benchmarks/wikitext2.txt (git-ignored)
+python -m pip install pyarrow
+python - <<'PY'
+import pyarrow.parquet as pq, urllib.request
+u = "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-2-raw-v1/test-00000-of-00001.parquet"
+urllib.request.urlretrieve(u, "wt2.parquet")
+txt = "".join(pq.read_table("wt2.parquet").column("text").to_pylist())
+open("benchmarks/wikitext2.txt", "w", encoding="utf-8", newline="").write(txt)
+PY
 
 cargo run --release --bin ppl -- benchmarks/gpt2 benchmarks/wikitext2.txt 512 256 8192
 # args: MODEL  TEXT_FILE  WINDOW  STRIDE  MAX_TOKENS
 ```
 
-Sanity: fp32 `gpt2` 124M gives perplexity ~29–30 on the WikiText-2 raw test
-split with `WINDOW=512 STRIDE=256`. A wildly different number means the harness
-is wrong (windowing, off-by-one on targets, stray special tokens).
+### Correctness — vs HuggingFace Transformers
+
+`ppl_ref.py` runs the identical windowing scheme on the same text file with HF as
+the model (the `ppl` analogue of `parity.py`):
+
+```bash
+python benchmarks/ppl_ref.py benchmarks/gpt2 benchmarks/wikitext2.txt 512 256 8192
+```
+
+| first 8192 tokens, `WINDOW=512 STRIDE=256` | mean NLL (nats/tok) | perplexity |
+|---|---|---|
+| MiniLLM `ppl` | 3.51105 | 33.483 |
+| HF Transformers `ppl_ref.py` | 3.51119 | 33.488 |
+
+Agreement to ~1e-4 nats (fp32 noise) — the harness is correct.
+
+### Baseline — `openai-community/gpt2` (124M), fp32
+
+| tokens scored | `WINDOW`/`STRIDE` | mean NLL | perplexity |
+|---|---|---|---|
+| 8,191 (`MAX_TOKENS=8192`) | 512 / 256 | 3.51105 | **33.48** |
+| 59,999 (`MAX_TOKENS=60000`) | 512 / 256 | 3.39918 | **29.94** |
+
+The first ~8k tokens of the test split are short biographical stubs and score
+high; over 60k it settles to ~29.9, in line with the usual "GPT-2 small ≈ 29" on
+WikiText-2. The KV-cache-quant ablation reports Δperplexity against this same
+fp32 baseline at a fixed `MAX_TOKENS`.

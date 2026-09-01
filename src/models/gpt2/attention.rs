@@ -1,7 +1,7 @@
 use candle_core::{IndexOp, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
 
-use crate::config::GPT2Config;
+use super::config::GPT2Config;
 use crate::kv_cache::LayerKvCache;
 
 pub struct MultiHeadAttention {
@@ -13,13 +13,13 @@ pub struct MultiHeadAttention {
 
 impl MultiHeadAttention {
     pub fn new(cfg: &GPT2Config, vb: VarBuilder) -> Result<Self> {
-        // let c_attn = candle_nn::linear(cfg.n_embd, 3 * cfg.n_embd, vb.pp("c_attn"))?;
-        // let c_proj = candle_nn::linear(cfg.n_embd, cfg.n_embd, vb.pp("c_proj"))?;
+        // GPT-2 checkpoints store these as HuggingFace `Conv1D` weights, i.e.
+        // `[in, out]` rather than `nn.Linear`'s `[out, in]`, so each needs a
+        // transpose that `candle_nn::linear` would not do.
         let c_attn_weight = vb.get((cfg.n_embd, 3 * cfg.n_embd), "c_attn.weight")?.t()?;
         let c_attn_bias = vb.get(3 * cfg.n_embd, "c_attn.bias")?;
-        let c_attn = candle_nn::Linear::new(c_attn_weight, Some(c_attn_bias));
+        let c_attn = Linear::new(c_attn_weight, Some(c_attn_bias));
 
-        // Manually load and transpose c_proj weights for GPT-2 compatibility
         let c_proj_vb = vb.pp("c_proj");
         let c_proj_weight = c_proj_vb.get((cfg.n_embd, cfg.n_embd), "weight")?.t()?;
         let c_proj_bias = c_proj_vb.get(cfg.n_embd, "bias")?;

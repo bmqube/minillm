@@ -26,7 +26,7 @@ use std::path::Path;
 
 use candle_core::{IndexOp, Tensor};
 use minillm::generation::Generator;
-use minillm::model::GPT2Model;
+use minillm::models::CausalLM;
 use minillm::{device, loader};
 use serde::Serialize;
 
@@ -82,6 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if use_cache { "KV cache" } else { "forward" }
     );
     let (net, tokenizer) = loader::load(&model, &dev)?;
+    let net = net.as_ref();
+    eprintln!(
+        "arch: {}  precision: {}",
+        net.meta().architecture,
+        net.precision()
+    );
 
     let raw = std::fs::read_to_string(&prompts_path)?;
     let prompts: Vec<&str> = raw
@@ -94,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for prompt in &prompts {
         let ids = tokenizer.encode(*prompt, true)?.get_ids().to_vec();
         let logits: Vec<f32> = if use_cache {
-            last_logits_cached(&net, &ids, &dev)?
+            last_logits_cached(net, &ids)?
         } else {
             let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
             net.forward_last(&input)?
@@ -127,11 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// step and return that step's logits. For a single-token prompt this is just a
 /// one-token prefill.
 fn last_logits_cached(
-    net: &GPT2Model,
+    net: &dyn CausalLM,
     ids: &[u32],
-    dev: &candle_core::Device,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut generator = Generator::new(net, dev);
+    let mut generator = Generator::new(net);
     let split = ids.len().saturating_sub(1);
 
     let logits = if split == 0 {

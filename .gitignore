@@ -1,9 +1,11 @@
 /target
 .env
 
-# Benchmark working files (downloaded weights, generated logits, run logs)
-/benchmarks/gpt2/
-/benchmarks/gpt2-*/
-/benchmarks/minillm_logits*.json
+# Benchmark working files (downloaded weights, generated logits, run logs).
+# Every checkpoint lives in its own directory under benchmarks/, so ignore the
+# directories wholesale rather than naming each model — a 1.5 GB safetensors
+# file is one forgotten pattern away otherwise.
+/benchmarks/*/
+/benchmarks/*logits*.json
 /benchmarks/wikitext2.txt
 /benchmarks/*.log

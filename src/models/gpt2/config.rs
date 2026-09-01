@@ -1,3 +1,5 @@
+use crate::models::ModelMeta;
+
 #[derive(Debug, Clone)]
 pub struct GPT2Config {
     pub vocab_size: usize,
@@ -7,9 +9,9 @@ pub struct GPT2Config {
     pub n_head: usize,
     /// LayerNorm epsilon. Defaults to GPT-2's `1e-5` when the checkpoint omits it.
     pub layer_norm_epsilon: f64,
-    /// MLP activation. Defaults to GPT-2's `"gelu_new"`; [`GPT2Model::new`](crate::model::GPT2Model::new)
+    /// MLP activation. Defaults to GPT-2's `"gelu_new"`; [`GPT2Model::new`](super::GPT2Model::new)
     /// rejects any other value rather than silently running the wrong activation,
-    /// since [`crate::activations::gelu`] implements only this one.
+    /// since [`crate::layers::gelu`] implements only this one.
     pub activation_function: String,
 }
 
@@ -78,6 +80,12 @@ impl Default for GPT2Config {
 }
 
 impl GPT2Config {
+    /// Width of one attention head. GPT-2 always splits the residual stream
+    /// evenly across heads, so unlike Qwen3 this is not an independent config key.
+    pub fn head_dim(&self) -> usize {
+        self.n_embd / self.n_head
+    }
+
     /// Analytic parameter count for a GPT-2 style model with tied token
     /// embedding / LM head, learned position embeddings and a 4x MLP ratio.
     ///
@@ -101,6 +109,22 @@ impl GPT2Config {
     pub fn kv_cache_bytes_per_token(&self, dtype_bytes: usize) -> usize {
         2 * self.n_layer * self.n_embd * dtype_bytes
     }
+
+    /// Architecture-independent view of this config.
+    pub fn meta(&self) -> ModelMeta {
+        ModelMeta {
+            architecture: "gpt2",
+            n_layer: self.n_layer,
+            n_head: self.n_head,
+            // GPT-2 predates grouped-query attention: one KV head per query head.
+            n_kv_head: self.n_head,
+            head_dim: self.head_dim(),
+            hidden_size: self.n_embd,
+            n_ctx: self.n_ctx,
+            vocab_size: self.vocab_size,
+            n_params: self.num_parameters(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +147,23 @@ mod tests {
             2 * 12 * 768 * 4
         );
         assert_eq!(GPT2Config::default().kv_cache_bytes_per_token(4), 73_728);
+    }
+
+    #[test]
+    fn meta_agrees_with_the_config_level_kv_formula() {
+        let cfg = GPT2Config::default();
+        assert_eq!(
+            cfg.meta().kv_cache_bytes_per_token(4),
+            cfg.kv_cache_bytes_per_token(4)
+        );
+    }
+
+    #[test]
+    fn meta_reports_no_grouped_query_attention() {
+        let m = GPT2Config::default().meta();
+        assert_eq!(m.n_kv_head, m.n_head);
+        assert_eq!(m.n_kv_groups(), 1);
+        assert_eq!(m.head_dim, 64);
     }
 
     fn base_json(extra: &str) -> String {

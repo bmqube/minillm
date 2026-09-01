@@ -1,19 +1,22 @@
 //! Sequence-length x model-size throughput sweep for MiniLLM.
 //!
 //! ```text
-//! cargo run --release --bin sweep -- [MODELS] [PREFILLS] [DECODE] [CACHE] [KVQUANT] [--repeats N]
-//!     > benchmarks/sweep_cpu.csv
+//! cargo run --release --bin sweep -- [MODELS] [PREFILLS] [DECODE] [CACHE] [KVQUANT]
+//!     [--repeats N] [--precision f32|f16|bf16] > benchmarks/sweep_cpu.csv
 //! ```
 //!
 //! Defaults: `benchmarks/gpt2  32,64,128,256,512  64  both  none  --repeats 1`.
 //!
 //! - `MODELS`    comma-separated local dirs (with `config.json`, `tokenizer.json`,
-//!   `model.safetensors`) or Hub ids like `openai-community/gpt2`.
+//!   and either `model.safetensors` or a shard index) or Hub ids like
+//!   `openai-community/gpt2` / `Qwen/Qwen3-0.6B`.
 //! - `PREFILLS`  comma-separated prompt lengths to test.
 //! - `DECODE`    greedy decode steps run after each prefill.
 //! - `CACHE`     `off`, `on`, or `both` — which decode paths to measure.
-//! - `KVQUANT`   `none` (fp32), `int8`, `int4` — how the `on` path stores K/V.
+//! - `KVQUANT`   `none`, `int8`, `int4` — how the `on` path stores K/V.
 //! - `--repeats` how many timed trials per configuration (default 1).
+//! - `--precision` pin the weight dtype; default is the checkpoint's own
+//!   `torch_dtype`, so GPT-2 stays fp32 and Qwen3 loads bf16.
 //!
 //! Emits **one CSV row per trial** — `(model, prefill, kv_cache, repeat)` — to
 //! stdout, so downstream analysis can compute its own error bars; a mean ± std
@@ -22,18 +25,21 @@
 //! more, not a single trial.
 
 use candle_core::{IndexOp, Tensor};
+use minillm::dtype::Precision;
 use minillm::generation::{greedy_no_cache, Generator, GREEDY};
 use minillm::kv_cache::KvQuant;
-use minillm::{device, loader, model::GPT2Model};
+use minillm::models::CausalLM;
+use minillm::{device, loader};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
 
-    // Pull `--repeats N` out, then read the positionals.
+    // Pull the flags out, then read the positionals.
     let mut positional: Vec<String> = Vec::new();
     let mut repeats: usize = 1;
+    let mut precision: Option<Precision> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -43,6 +49,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .parse()
                     .unwrap_or_else(|_| panic!("--repeats expects a number, got {v:?}"));
                 assert!(repeats >= 1, "--repeats must be >= 1");
+            }
+            "--precision" => {
+                let v = it.next().unwrap_or_default();
+                precision = Some(
+                    Precision::parse(&v)
+                        .unwrap_or_else(|| panic!("--precision expects f32|f16|bf16, got {v:?}")),
+                );
             }
             _ => positional.push(a),
         }
@@ -73,11 +86,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("prefills     : {prefills:?}");
     eprintln!("decode steps : {decode}");
     eprintln!("cache        : {cache_arg}");
-    eprintln!("kv_quant     : {kv_quant:?}");
+    eprintln!("kv_quant     : {kv_quant}");
     eprintln!("repeats      : {repeats}");
+    eprintln!(
+        "precision    : {}",
+        precision.map_or("checkpoint default".to_string(), |p| p.to_string())
+    );
 
     println!(
-        "model,params,kv_bytes_per_token,device,dtype,kv_cache,kv_quant,repeat,\
+        "model,arch,params,n_kv_head,kv_bytes_per_token,device,dtype,kv_cache,kv_quant,repeat,\
          prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,\
          prefill_tok_s,decode_tok_s,decode_s"
     );
@@ -88,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for model_id in &models {
         eprintln!("\n=== {model_id} ===");
         let t0 = Instant::now();
-        let (model, _tok) = match loader::load(model_id, &dev) {
+        let (model, _tok) = match loader::load_with(model_id, &dev, precision) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("  load failed: {e}  (skipping)");
@@ -96,14 +113,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
         let load_s = t0.elapsed().as_secs_f64();
-        let cfg = model.config();
-        let params = cfg.num_parameters();
-        let head_dim = cfg.n_embd / cfg.n_head;
-        let kv_bpt_fp32 = cfg.kv_cache_bytes_per_token(4);
-        let kv_bpt_on = kv_quant.bytes_per_token(cfg.n_layer, cfg.n_head, head_dim);
+        let model = model.as_ref();
+        let meta = model.meta().clone();
+        let dtype = model.precision();
+        let params = meta.n_params;
+        let arch = meta.architecture;
+        let n_kv_head = meta.n_kv_head;
+        // The `off` rows carry the unquantized cost so both rows of a pair stay
+        // comparable against the same baseline.
+        let kv_bpt_full = meta.kv_cache_bytes_per_token_at(dtype);
+        let kv_bpt_on = meta.kv_cache_bytes_per_token_with(kv_quant, dtype);
         eprintln!(
-            "  loaded in {load_s:.2} s, {params} params, KV {kv_bpt_fp32} B/token fp32, \
-             {kv_bpt_on} B/token {kv_quant:?}"
+            "  loaded in {load_s:.2} s, {arch}, {params} params, {dtype}, \
+             {}/{} q/kv heads, KV {kv_bpt_full} B/token {dtype}, \
+             {kv_bpt_on} B/token {kv_quant}",
+            meta.n_head, meta.n_kv_head
         );
 
         for &prefill in &prefills {
@@ -129,32 +153,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let emit =
                     |kv: &str, quant: &str, kv_bpt: usize, decode_tok_s: f64, decode_s: f64| {
                         println!(
-                            "{model_id},{params},{kv_bpt},{dev_str},f32,{kv},{quant},{repeat},\
-                             {prefill},{decode},{prefill},{},{load_s:.3},{prefill_ms:.1},\
-                             {prefill_tok_s:.2},{decode_tok_s:.3},{decode_s:.3}",
+                            "{model_id},{arch},{params},{n_kv_head},{kv_bpt},{dev_str},{dtype},\
+                             {kv},{quant},{repeat},{prefill},{decode},{prefill},{},\
+                             {load_s:.3},{prefill_ms:.1},{prefill_tok_s:.2},\
+                             {decode_tok_s:.3},{decode_s:.3}",
                             prefill + decode
                         );
                     };
 
                 if do_off {
-                    let (tps, s) = time_decode_no_cache(&model, &ids, decode, &dev)?;
-                    emit("off", "none", kv_bpt_fp32, tps, s);
+                    let (tps, s) = time_decode_no_cache(model, &ids, decode)?;
+                    emit("off", "none", kv_bpt_full, tps, s);
                     trials
                         .entry(format!("{model_id} prefill={prefill} off"))
                         .or_default()
                         .push(tps);
                 }
                 if do_on {
-                    let (tps, s) = time_decode_cached(&model, &ids, decode, kv_quant, &dev)?;
-                    emit(
-                        "on",
-                        &format!("{kv_quant:?}").to_lowercase(),
-                        kv_bpt_on,
-                        tps,
-                        s,
-                    );
+                    let (tps, s) = time_decode_cached(model, &ids, decode, kv_quant)?;
+                    emit("on", kv_quant.as_str(), kv_bpt_on, tps, s);
                     trials
-                        .entry(format!("{model_id} prefill={prefill} on/{kv_quant:?}"))
+                        .entry(format!("{model_id} prefill={prefill} on/{kv_quant}"))
                         .or_default()
                         .push(tps);
                 }
@@ -179,13 +198,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// Time `steps` greedy tokens with no cache (full recompute each step).
 fn time_decode_no_cache(
-    model: &GPT2Model,
+    model: &dyn CausalLM,
     prompt: &[u32],
     steps: usize,
-    dev: &candle_core::Device,
 ) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
     let t = Instant::now();
-    greedy_no_cache(model, dev, prompt, steps)?;
+    greedy_no_cache(model, prompt, steps)?;
     let s = t.elapsed().as_secs_f64();
     Ok((steps as f64 / s, s))
 }
@@ -193,13 +211,12 @@ fn time_decode_no_cache(
 /// Time `steps` greedy tokens against a KV cache. The prefill seeds the cache
 /// and is deliberately excluded from the timing.
 fn time_decode_cached(
-    model: &GPT2Model,
+    model: &dyn CausalLM,
     prompt: &[u32],
     steps: usize,
     quant: KvQuant,
-    dev: &candle_core::Device,
 ) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-    let mut generator = Generator::with_quant(model, dev, quant);
+    let mut generator = Generator::with_quant(model, quant);
     generator.prefill(prompt)?;
     let t = Instant::now();
     for _ in 0..steps {

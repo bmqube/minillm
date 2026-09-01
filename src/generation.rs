@@ -16,7 +16,7 @@ use candle_core::{Device, IndexOp, Result, Tensor};
 use rand::{Rng, RngExt};
 
 use crate::kv_cache::{KvCache, KvQuant};
-use crate::model::GPT2Model;
+use crate::models::CausalLM;
 
 /// How to turn a logits vector into the next token id.
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +199,9 @@ pub const GREEDY: SamplingConfig = SamplingConfig {
 /// Drives the KV-cache decode loop: prefill the prompt once, then feed one token
 /// per step. Holds the cache and the logits for the most recent position.
 ///
+/// Works with any [`CausalLM`], so the same loop drives GPT-2 and Qwen3
+/// unchanged; the device and layer count come from the model.
+///
 /// ```no_run
 /// # use minillm::{device, loader};
 /// # use minillm::generation::{Generator, GREEDY};
@@ -207,7 +210,7 @@ pub const GREEDY: SamplingConfig = SamplingConfig {
 /// let (model, tok) = loader::load("openai-community/gpt2", &dev)?;
 /// let ids = tok.encode("Hello", true).unwrap().get_ids().to_vec();
 ///
-/// let mut gen = Generator::new(&model, &dev);
+/// let mut gen = Generator::new(model.as_ref());
 /// gen.prefill(&ids)?;
 /// for _ in 0..20 {
 ///     let id = gen.next_token(&GREEDY)?;
@@ -217,32 +220,37 @@ pub const GREEDY: SamplingConfig = SamplingConfig {
 /// # }
 /// ```
 pub struct Generator<'m> {
-    model: &'m GPT2Model,
+    model: &'m dyn CausalLM,
     device: Device,
     cache: KvCache,
     logits: Option<Tensor>,
 }
 
 impl<'m> Generator<'m> {
-    /// A generator backed by a full-precision KV cache.
-    pub fn new(model: &'m GPT2Model, device: &Device) -> Self {
-        Self::with_quant(model, device, KvQuant::None)
+    /// A generator backed by a KV cache at the model's own precision.
+    pub fn new(model: &'m dyn CausalLM) -> Self {
+        Self::with_quant(model, KvQuant::None)
     }
 
     /// A generator whose KV cache stores K/V with `quant`.
-    pub fn with_quant(model: &'m GPT2Model, device: &Device, quant: KvQuant) -> Self {
+    pub fn with_quant(model: &'m dyn CausalLM, quant: KvQuant) -> Self {
         Self {
+            device: model.device().clone(),
+            cache: KvCache::with_quant(model.meta().n_layer, quant),
             model,
-            device: device.clone(),
-            cache: KvCache::with_quant(model.config().n_layer, quant),
             logits: None,
         }
+    }
+
+    /// The model this generator decodes with.
+    pub fn model(&self) -> &'m dyn CausalLM {
+        self.model
     }
 
     /// Run `ids` through the model in one pass, seeding the cache. Returns the
     /// logits for the position after the last prompt token.
     ///
-    /// Uses [`GPT2Model::forward_with_cache_last`] so `lm_head` runs on just
+    /// Uses [`CausalLM::forward_with_cache_last`] so the LM head runs on just
     /// that one position instead of the whole prompt.
     pub fn prefill(&mut self, ids: &[u32]) -> Result<&Tensor> {
         if ids.is_empty() {
@@ -318,13 +326,12 @@ impl<'m> Generator<'m> {
 /// Greedily generate `steps` tokens after `prompt`, using a KV cache with
 /// `quant` storage. Returns the generated ids (not including the prompt).
 pub fn greedy(
-    model: &GPT2Model,
-    device: &Device,
+    model: &dyn CausalLM,
     prompt: &[u32],
     steps: usize,
     quant: KvQuant,
 ) -> Result<Vec<u32>> {
-    let mut gen = Generator::with_quant(model, device, quant);
+    let mut gen = Generator::with_quant(model, quant);
     gen.prefill(prompt)?;
     let mut out = Vec::with_capacity(steps);
     for _ in 0..steps {
@@ -334,20 +341,16 @@ pub fn greedy(
 }
 
 /// Greedily generate `steps` tokens with **no** cache: every step re-runs the
-/// whole sequence through [`GPT2Model::forward_last`]. The O(n^2) reference
+/// whole sequence through [`CausalLM::forward_last`]. The O(n^2) reference
 /// path that [`greedy`] is measured against — and the oracle the cache is
 /// checked for equality with. Uses `forward_last` rather than `forward` since
 /// only the final position's logits are ever consumed here.
-pub fn greedy_no_cache(
-    model: &GPT2Model,
-    device: &Device,
-    prompt: &[u32],
-    steps: usize,
-) -> Result<Vec<u32>> {
+pub fn greedy_no_cache(model: &dyn CausalLM, prompt: &[u32], steps: usize) -> Result<Vec<u32>> {
+    let device = model.device().clone();
     let mut seq = prompt.to_vec();
     let mut out = Vec::with_capacity(steps);
     for _ in 0..steps {
-        let input = Tensor::from_vec(seq.clone(), (1, seq.len()), device)?;
+        let input = Tensor::from_vec(seq.clone(), (1, seq.len()), &device)?;
         let row: Vec<f32> = model
             .forward_last(&input)?
             .i(0)?

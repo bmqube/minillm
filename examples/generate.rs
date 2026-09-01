@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         top_p: Some(0.95),
     };
 
-    let mut generator = Generator::new(&model, &dev);
+    let mut generator = Generator::new(model.as_ref());
     generator.prefill(&ids)?;
 
     print!("{prompt}");

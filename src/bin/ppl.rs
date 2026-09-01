@@ -86,9 +86,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("model    : {model_id}");
     eprintln!("text     : {text_path}");
     eprintln!("window   : {window}   stride : {stride}   max_tokens : {max_tokens}");
-    eprintln!("kv_quant : {kv_quant:?}");
+    eprintln!("kv_quant : {kv_quant}");
 
     let (model, tokenizer) = loader::load(&model_id, &dev)?;
+    let model = model.as_ref();
+    eprintln!(
+        "arch     : {}   precision : {}",
+        model.meta().architecture,
+        model.precision()
+    );
 
     let text = std::fs::read_to_string(&text_path).map_err(|e| {
         format!("could not read {text_path}: {e}\n  see benchmarks/README.md for how to fetch WikiText-2")
@@ -107,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("tokens : {n}");
     assert!(n >= 2, "need at least 2 tokens to score anything");
 
-    let ctx = model.config().n_ctx;
+    let ctx = model.meta().n_ctx;
     assert!(window <= ctx, "WINDOW {window} exceeds model context {ctx}");
 
     let t0 = Instant::now();
@@ -131,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Fresh cache per window; a single prefill call quantizes every
                 // position's K/V, so the logits reflect the int8-round-tripped
                 // cache exactly as a decode loop would.
-                let mut cache = KvCache::with_quant(model.config().n_layer, q);
+                let mut cache = KvCache::with_quant(model.meta().n_layer, q);
                 model.forward_with_cache(&input, &mut cache)?
             }
         };
@@ -162,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bits_per_token = mean_nll / std::f64::consts::LN_2;
 
     println!();
-    println!("kv_quant            : {kv_quant:?}");
+    println!("kv_quant            : {kv_quant}");
     println!("windows scored      : {windows}");
     println!("tokens scored       : {scored}");
     println!("mean NLL (nats/tok) : {mean_nll:.5}");

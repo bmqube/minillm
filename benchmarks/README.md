@@ -13,15 +13,29 @@ below.
 
 ## 0. Get the weights (once)
 
-The benchmarks load GPT-2 from a local directory so MiniLLM and the Python
+The benchmarks load models from a local directory so MiniLLM and the Python
 reference use byte-identical weights (and so nothing depends on a shared HF
-cache). `benchmarks/gpt2/` is git-ignored; populate it once:
+cache). Every directory under `benchmarks/` is git-ignored; populate them once:
 
 ```bash
 mkdir -p benchmarks/gpt2 && cd benchmarks/gpt2
 base=https://huggingface.co/openai-community/gpt2/resolve/main
 for f in config.json tokenizer.json model.safetensors; do curl -sL -o "$f" "$base/$f"; done
+cd ../..
+
+mkdir -p benchmarks/qwen3-0.6b && cd benchmarks/qwen3-0.6b
+base=https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main
+for f in config.json tokenizer.json model.safetensors; do curl -sL -o "$f" "$base/$f"; done
+cd ../..
 ```
+
+Running any of this on a GPU: see [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md).
+
+> **Precision.** GPT-2 publishes fp32 weights and Qwen3 publishes bf16, and the
+> loader follows the checkpoint unless told otherwise. candle has no CPU bf16
+> gemm, so **every CPU number below is fp32** — Qwen3 included, loaded at 2x its
+> published size with a note on stderr. On CUDA, Qwen3 stays bf16. Pin with
+> `--precision` when comparing across devices.
 
 The binaries also accept a Hub id (`openai-community/gpt2`) instead of the
 directory, if you'd rather use the HF cache.
@@ -112,26 +126,39 @@ Metrics: `mse`, `mae`, `max|Δ|`, cosine similarity,
 A large KL or any top-1 miss means a real discrepancy (weight transpose,
 activation, LayerNorm eps, position ids, tying).
 
-### Results — `openai-community/gpt2`
+`parity.py` dispatches through `AutoModelForCausalLM`, so the same script is the
+gate for both architectures. It pins the reference to fp32 regardless of the
+checkpoint's dtype — a bf16 reference would put the reference's own rounding
+error inside the thresholds.
 
-Reference: transformers 5.16.1, torch 2.13.0+cpu, numpy 2.5.2 · same fp32
-`benchmarks/gpt2/` weights.
+### Results
 
-| aggregate | `forward` | `--cache` |
-|---|---|---|
-| prompts | 24 | 24 |
-| mean mse | **1.772e-09** | **2.244e-09** |
-| mean cosine similarity | **1.00000** | **1.00000** |
-| mean KL(hf‖mini) | **1.697e-10** | **1.658e-10** |
-| per-prompt max\|Δ\| (logit) | ~1–2 × 10⁻⁴ | ~1–2 × 10⁻⁴ |
-| top-1 agreement | **24 / 24** | **24 / 24** |
-| top-5 overlap | **120 / 120** | **120 / 120** |
+Reference: transformers 5.16.1, torch 2.13.0+cpu, numpy 2.5.2 · same local
+weights, fp32 both sides, 24 prompts.
 
-Both the full-recompute forward pass and the KV-cache decode path match
-HuggingFace to floating-point noise. The Rust integration test
-`tests/cache_parity.rs` additionally asserts that greedy generation with the
-cache yields the exact same token ids as `forward` (run:
-`cargo test --test cache_parity -- --ignored`).
+| aggregate | gpt2 `forward` | gpt2 `--cache` | qwen3 `forward` | qwen3 `--cache` |
+|---|---|---|---|---|
+| mean mse | **1.725e-09** | **2.026e-09** | **1.355e-10** | **1.224e-10** |
+| mean cosine similarity | **1.00000** | **1.00000** | **1.00000** | **1.00000** |
+| mean KL(hf‖mini) | 1.655e-10 | 1.729e-10 | 2.064e-11 | 2.094e-11 |
+| per-prompt max\|Δ\| (logit) | ~1–2 × 10⁻⁴ | ~1–2 × 10⁻⁴ | ~0–1 × 10⁻⁴ | ~0–1 × 10⁻⁴ |
+| top-1 agreement | **24 / 24** | **24 / 24** | **24 / 24** | **24 / 24** |
+| top-5 overlap | **120 / 120** | **120 / 120** | **120 / 120** | **120 / 120** |
+
+Both architectures match HuggingFace to floating-point noise on both the
+full-recompute forward pass and the KV-cache decode path. Qwen3's residuals are
+about an order of magnitude tighter than GPT-2's, consistent with RMSNorm and
+QK-norm keeping activations in a narrower range than GPT-2's LayerNorm.
+
+`tests/cache_parity.rs` adds four checks per architecture, run with
+`cargo test --test cache_parity -- --ignored`:
+
+| test | what it catches |
+|---|---|
+| `cache_matches_no_cache` | cached greedy decode must emit byte-identical ids to full recompute |
+| `incremental_prefill_matches_bulk` | feeding the prompt one token at a time must match one bulk prefill — this is what a wrong RoPE offset breaks, and a full-sequence-only test cannot see it |
+| `cache_stores_kv_heads_not_query_heads` | the cached key tensor must be `[batch, n_kv_head, seq, head_dim]`; caching the `repeat_kv`-expanded copy still yields correct logits, so only a shape assertion finds it |
+| `quantized_caches_stay_close` | int8/int4 drift, scaled by the logit standard deviation |
 
 ## 3. Larger GPT-2 variants (optional)
 
@@ -186,6 +213,38 @@ run's own seq-512 KV-cache row (±32%) is a case in point: its 3 trials were
 18.2, 34.0, 34.5 tok/s — one trial ran alongside other CPU-bound work in the
 same session. Prefer `--repeats 5` or more on an idle box for numbers you plan
 to cite.
+
+### Cross-architecture — gpt2 124M vs Qwen3-0.6B, CPU, fp32
+
+Both at fp32 (Qwen3 falls back from its published bf16 on CPU), 16 decode steps,
+mean ± sample std over 3 trials. Raw rows in
+[`sweep_cpu_multiarch.csv`](sweep_cpu_multiarch.csv).
+
+| model | prefill | no cache | KV cache | speedup |
+|---|---|---|---|---|
+| gpt2 124M | 16 | 17.66 ± 1.60 | 53.09 ± 0.66 | 3.0× |
+| gpt2 124M | 64 | 7.19 ± 0.15 | 42.23 ± 8.25 | 5.9× |
+| gpt2 124M | 128 | 3.86 ± 0.18 | 42.15 ± 4.60 | 10.9× |
+| Qwen3 0.6B | 16 | 2.51 ± 0.01 | 11.34 ± 0.32 | 4.5× |
+| Qwen3 0.6B | 64 | 1.30 ± 0.01 | 10.57 ± 0.52 | 8.1× |
+| Qwen3 0.6B | 128 | 0.77 ± 0.00 | 8.51 ± 0.09 | 11.1× |
+
+Qwen3 is ~4.8× the parameters and lands at ~1/5 the cached decode rate, which is
+roughly what a memory-bandwidth-bound decode predicts. Its cache is 229,376
+B/token at fp32 against GPT-2's 73,728 — 3.1× larger despite grouped-query
+attention already halving it, because 28 layers × 128-wide heads outweighs
+GPT-2's 12 × 64. Without GQA it would be 6.2×.
+
+> The Qwen3 cached rows are ~26% faster than the first version of this table
+> because `attend` was forcing a contiguous copy of the expanded K and of V on
+> every step. `repeat_kv` already returns contiguous tensors and candle's matmul
+> takes the transposed stride directly, so both copies were pure overhead — the
+> same lesson as the GPT-2 `attend()` copy removed earlier. Parity was unchanged
+> either way, which is exactly why a correctness gate cannot be the only gate.
+
+These are small-context CPU numbers and should be read as a smoke test, not a
+result: the interesting regime for a KV cache is thousands of tokens on a GPU,
+which is what [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) is for.
 
 ## 5. Perplexity (`ppl`)
 
@@ -396,3 +455,54 @@ noise (the trial spread here is ≤1 tok/s on both rows). int4 buys another 1.7�
 compression for a real ~3.8% perplexity cost *and* a ~44% speed cost. Realising
 the memory saving as lower *peak* RSS, and recovering the speed, both need the
 attention matmul itself to run at low precision.
+
+## 8. The int8-is-free result does not transfer to Qwen3
+
+Everything in §7 was measured on GPT-2. Repeating the *same* cache on Qwen3-0.6B
+gives a materially different answer, and this is the most consequential finding
+from supporting a second architecture.
+
+Prefill logit drift on the fixed prompt `"A transformer is a deep learning
+architecture that"`, scaled by the standard deviation of the reference logits
+(absolute deltas are not comparable across models with different logit scales):
+
+| model | logit σ | int8 drift | int4 drift | int8 top-1 |
+|---|---|---|---|---|
+| gpt2 124M | 4.177 | **0.038 σ** | 0.228 σ | preserved |
+| Qwen3 0.6B | 2.597 | **0.268 σ** | **3.525 σ** | **changed** (646 → 374) |
+
+Qwen3 is **~7× more sensitive to int8** and **~15× more to int4**. On this
+prompt int8 flips its top-1 token (646 → 374) while GPT-2's is untouched, and
+int4's 3.7 σ drift means the cache is no longer approximating the model.
+
+Reproduce with:
+
+```bash
+cargo test --release --test cache_parity -- --ignored --nocapture
+```
+
+**Why.** Consistent with KVQuant's finding that *post-RoPE, per-token key*
+quantization is the weak point of the naive scheme, for two compounding reasons:
+
+1. **RoPE mixes channel pairs.** This cache quantizes K *after* the rotation, so
+   each stored vector is a position-dependent mixture of channels. Outliers that
+   sat in a few fixed channels get spread across the vector that one scale has to
+   cover. GPT-2 has no rotation, so its keys keep whatever channel structure they
+   were trained with. Quantizing pre-RoPE, or per-channel rather than per-token,
+   is the known fix — and is not implemented here.
+2. **`head_dim` is 128, not 64.** Twice as many elements share a single scale, so
+   the same scheme is simply coarser on Qwen3.
+
+Grouped-query attention plausibly compounds it further — each cached K/V serves
+2 query heads on Qwen3-0.6B (8 on Qwen3-8B), so an error in one cached vector is
+not averaged away across independent heads the way it is under MHA — but this
+has not been isolated here and is a hypothesis, not a measured claim.
+
+**What this does and does not establish.** It is a single-prompt logit
+measurement on one small model of each family, not a quality benchmark. The
+honest next step is the perplexity sweep in
+[`GPU-RUNBOOK.md`](GPU-RUNBOOK.md) §4.4, which measures the same thing on 60k
+tokens of WikiText-2 and would either confirm the gap or show it is an artifact
+of one prompt. What it already does establish is narrower but solid: **"int8 KV
+cache is free" is a claim about an architecture, not about int8**, and a study
+that only ever ran GPT-2 could not have noticed.

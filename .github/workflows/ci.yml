@@ -31,9 +31,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # The `#[ignore]`d integration tests need GPT-2 weights on disk; the rest
-      # (samplers, KV-cache container, quantization round-trips, doctests) run
-      # without downloading anything.
+      # The `#[ignore]`d integration tests need GPT-2 / Qwen3 weights on disk.
+      # Everything else — samplers, KV-cache container and quantization
+      # round-trips, RoPE against a scalar reference, GQA head mapping, config
+      # parsing for both architectures, doctests — runs without downloading
+      # anything.
       - name: Test
         run: cargo test --all-targets
 

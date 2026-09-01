@@ -2,8 +2,27 @@
 
 [![CI](https://github.com/bmqube/minillm/actions/workflows/ci.yml/badge.svg)](https://github.com/bmqube/minillm/actions/workflows/ci.yml)
 
-A small GPT-2 inference engine written in Rust. It loads GPT-2 checkpoints from
-the HuggingFace Hub and runs autoregressive text generation on CPU or CUDA.
+A small transformer inference engine written in Rust. It loads decoder-only
+checkpoints from the HuggingFace Hub and runs autoregressive text generation on
+CPU or CUDA, with a KV cache that can store keys and values at full precision,
+per-token int8, or per-token packed int4.
+
+Two architectures, one interface:
+
+| | GPT-2 | Qwen3 |
+|---|---|---|
+| checkpoints | `openai-community/gpt2{,-medium,-large,-xl}` | `Qwen/Qwen3-{0.6B,1.7B,4B,8B,14B}` |
+| positions | learned `wpe` table | RoPE (`rope_theta` 1e6) |
+| normalization | LayerNorm | RMSNorm |
+| attention | multi-head, fused QKV | grouped-query, separate Q/K/V |
+| Q/K scaling | — | per-head RMSNorm (QK-norm) before RoPE |
+| MLP | 4×, tanh-GELU | SwiGLU |
+| weight layout | Conv1D `[in, out]` | `nn.Linear` `[out, in]` |
+| context | 1024 | 40960 |
+| published dtype | fp32 | bf16 |
+
+Both are verified against HuggingFace Transformers to floating-point noise, on
+the forward path *and* the KV-cache path (see [Benchmarks](#benchmarks)).
 
 ## Two implementations
 
@@ -17,45 +36,65 @@ If you want to see the transformer built without a tensor framework, read the
 
 ## Status and scope
 
-- **Works:** GPT-2 (`openai-community/gpt2`) weight loading, forward pass,
-  greedy / temperature / top-k / top-p sampling, CPU and CUDA execution.
-- **Weights are fp32.** No weight quantization.
-- **KV cache.** `GPT2Model::forward_with_cache` decodes one token per step
-  against a per-layer key/value cache — O(n) instead of the O(n²) full-recompute
+- **Works:** GPT-2 and Qwen3 weight loading (single-file *and* sharded
+  safetensors), forward pass, greedy / temperature / top-k / top-p sampling,
+  CPU and CUDA execution.
+- **No weight quantization.** Weights load at the checkpoint's own
+  `torch_dtype` — fp32 for GPT-2, bf16 for Qwen3 — or at an explicit
+  `Precision`. candle has no CPU bf16 gemm, so a bf16 checkpoint on CPU falls
+  back to fp32 with a note; on CUDA it stays bf16.
+- **KV cache.** `forward_with_cache` decodes one token per step against a
+  per-layer key/value cache — O(n) instead of the O(n²) full-recompute
   `forward`. ~11× faster greedy decode on CPU at seq 64→192 (up to ~31× by seq
   512→544, see the sweep in [benchmarks](benchmarks/)), and the cached path
   still matches HuggingFace to fp32 noise. The plain `forward` is kept as the
-  reference and pre-cache baseline; both it and the cached path skip `lm_head`
+  reference and pre-cache baseline; both it and the cached path skip the LM head
   on positions the caller won't use (`forward_last` / `forward_with_cache_last`).
+- **Grouped-query attention is respected in the cache.** Only the narrow
+  `n_kv_head` tensors are stored; `repeat_kv` expands to the query head count
+  per step and is never cached. On Qwen3-0.6B (16 query heads over 8 KV heads)
+  that is a 2× smaller cache before any quantization.
 - **Quantized KV cache.** `KvQuant::Int8` (per-token symmetric) is 3.76× smaller
-  for effectively no perplexity change (Δ ≈ +0.008 on WikiText-2) and ~4–10%
-  slower decode up to 256 tokens of context, ~20% by 512. `KvQuant::Int4`
-  (per-token asymmetric, packed) is 6.4× smaller for ~+3.8% perplexity and a
-  19–64% decode penalty. Storage dequantizes to fp32 for the matmul, so peak
-  RSS is unchanged either way — see [benchmarks](benchmarks/).
-- Larger GPT-2 sizes (`gpt2-medium/large/xl`) share the architecture and should
-  load, but only the 124M base model is regularly exercised.
+  and `KvQuant::Int4` (per-token asymmetric, packed) 6.4× smaller. On GPT-2 int8
+  costs effectively nothing (Δppl ≈ +0.008 on WikiText-2) — **but that result
+  does not transfer to Qwen3**, which is ~7× more sensitive to int8 and ~15×
+  more to int4, to the point where int8 changes the top-1 token on prompts GPT-2
+  handles unaffected. See [Benchmarks](#benchmarks).
+- Larger sizes (`gpt2-medium/large/xl`, `Qwen3-1.7B` and up) share their
+  family's architecture and load through the same path, but only `gpt2` 124M and
+  `Qwen3-0.6B` are regularly exercised.
 - Inference only — no training.
 
 ## Architecture
 
+Architecture-specific code lives under `models/`, behind the `CausalLM` trait.
+Everything above it — the decode loop, the cache, the benchmark harnesses — is
+generic and never names a concrete model type.
+
 ```
 src/
 ├── lib.rs          library root
-├── main.rs         CLI demo (loads gpt2, generates 50 tokens)
-├── loader.rs       download config + tokenizer + safetensors from the HF Hub
-├── config.rs       GPT2Config + analytic parameter / KV-cache-byte counts
-├── model.rs        GPT2Model: forward[_last] + forward_with_cache[_last], embeddings, blocks, offset causal mask
-├── transformers.rs TransformerBlock: pre-LN attention + MLP with residuals, cache-aware variant
-├── attention.rs    MultiHeadAttention: fused QKV, scaled dot-product, full + incremental paths
-├── activations.rs  tanh-approx GELU (matches GPT-2's gelu_new)
+├── main.rs         CLI demo: [MODEL] [PROMPT], KV-cache decode
+├── loader.rs       config parsing, architecture dispatch, sharded safetensors, precision choice
+├── dtype.rs        Precision (f32/f16/bf16) + what each device can actually run
+├── device.rs       pick CUDA if built with --features cuda, else CPU
 ├── generation.rs   Generator (decode loop) + SamplingConfig / sample(): greedy / temp / top-k / top-p
-├── kv_cache.rs     KvCache / LayerKvCache: per-layer K/V cache, fp32 or per-token int8 / int4
-└── device.rs       pick CUDA if built with --features cuda, else CPU
+├── kv_cache.rs     KvCache / LayerKvCache: per-layer K/V, model precision or per-token int8 / int4
+│
+├── layers/         primitives shared across architectures
+│   ├── activation.rs  tanh-approx GELU (GPT-2's gelu_new) + SiLU (Qwen3's SwiGLU gate)
+│   ├── mask.rs        additive causal + sliding-window masks, dtype-aware
+│   ├── rope.rs        rotary embeddings, offset-aware for cached decode
+│   └── mod.rs         repeat_kv: GQA head expansion
+│
+└── models/
+    ├── mod.rs      CausalLM trait + ModelMeta (layers, q/kv heads, head_dim, ctx, params)
+    ├── gpt2/       config, attention (fused QKV, MHA), block (pre-LN + GELU MLP), model
+    └── qwen3/      config, attention (GQA + QK-norm + RoPE), block (RMSNorm + SwiGLU), model
 
 src/bin/
 ├── bench.rs        throughput + size benchmark, no-cache vs KV-cache decode
-├── sweep.rs        seq-len sweep (cache off/on, fp32/int8/int4, --repeats N) → CSV
+├── sweep.rs        seq-len sweep (cache off/on, quant, --repeats N, --precision) → CSV
 ├── ppl.rs          sliding-window perplexity on a text file (--kv-quant off|int8|int4)
 ├── memprobe.rs     peak-RSS probe for one decode path (KV-cache memory cost)
 └── parity_dump.rs  dump logits for the parity check (--cache exercises the cache path)
@@ -64,10 +103,22 @@ examples/
 └── generate.rs     minimal library-usage example (KV-cache decode loop)
 
 tests/
-└── cache_parity.rs cache == full-recompute; quantized caches stay close (ignored; needs weights)
+└── cache_parity.rs cache == full-recompute, incremental == bulk prefill, GQA cache
+                    shape, quantization drift — per architecture (ignored; needs weights)
 
-benchmarks/         prompt set, parity script, methodology + results
+benchmarks/         prompt set, parity scripts, methodology + results, GPU runbook
 ```
+
+### Adding an architecture
+
+1. `src/models/<name>/` with `config.rs` (deserialize `config.json`, expose a
+   `ModelMeta`), `attention.rs`, `block.rs`, `model.rs`.
+2. `impl CausalLM for <Name>Model`.
+3. One arm in `loader::Architecture` and its `config.json` probe.
+
+Reuse `layers/` for anything that isn't specific to the architecture. Nothing
+else in the crate needs to change — the binaries, the cache and the decode loop
+are already generic.
 
 ## Build
 
@@ -101,15 +152,19 @@ for the MSVC `link.exe`-shadowing case.
 ### CLI
 
 ```bash
-cargo run --release                       # CPU
-cargo run --release --features cuda        # GPU
+cargo run --release                                        # gpt2, CPU
+cargo run --release --features cuda                         # gpt2, GPU
+cargo run --release -- Qwen/Qwen3-0.6B "Once upon a time"   # qwen3
 ```
 
-Downloads `openai-community/gpt2` on first run and prints a 50-token completion
-of a fixed prompt, followed by a tok/s line on stderr.
+Arguments are `[MODEL] [PROMPT]`, where `MODEL` is a Hub id or a local
+directory. Downloads on first run and prints a 50-token completion, followed by
+a tok/s line on stderr.
 
 ### Library
 
+`loader::load` returns a `Box<dyn CausalLM>` — the architecture is picked from
+the checkpoint's `config.json`, so the calling code is identical either way.
 `Generator` owns the KV cache and drives the decode loop: prefill the prompt
 once, then take one token per step.
 
@@ -119,12 +174,13 @@ use minillm::{device, loader};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dev = device::best();
+    // Swap for "Qwen/Qwen3-0.6B" and nothing below changes.
     let (model, tokenizer) = loader::load("openai-community/gpt2", &dev)?;
 
     let ids = tokenizer.encode("The future of AI is", true)?.get_ids().to_vec();
     let cfg = SamplingConfig { temperature: 0.8, top_k: Some(40), top_p: Some(0.95) };
 
-    let mut generator = Generator::new(&model, &dev);
+    let mut generator = Generator::new(model.as_ref());
     generator.prefill(&ids)?;
 
     for _ in 0..40 {
@@ -134,6 +190,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 ```
+
+`model.meta()` exposes the shape facts a caller might need — layer count, query
+and KV head counts, `head_dim`, context window, parameter count, and
+`kv_cache_bytes_per_token_with(quant, precision)` for cache accounting.
+
+### Precision
+
+```rust
+use minillm::dtype::Precision;
+let (model, tok) = loader::load_with("Qwen/Qwen3-0.6B", &dev, Some(Precision::BF16))?;
+```
+
+Omit the override and the checkpoint's own `torch_dtype` is used. candle has no
+CPU bf16 gemm, so on CPU a bf16 checkpoint falls back to fp32 with a note, while
+an *explicit* `Precision::BF16` on CPU is refused outright rather than failing
+later inside a matmul.
 
 Run the same thing as an example:
 
@@ -145,12 +217,14 @@ Other entry points:
 
 | | |
 |---|---|
-| `Generator::with_quant(&model, &dev, KvQuant::Int8)` | quantized KV cache |
-| `generation::greedy(&model, &dev, &ids, n, quant)` | one-shot greedy decode |
-| `generation::greedy_no_cache(&model, &dev, &ids, n)` | the O(n²) reference path |
+| `Generator::with_quant(model, KvQuant::Int8)` | quantized KV cache |
+| `generation::greedy(model, &ids, n, quant)` | one-shot greedy decode |
+| `generation::greedy_no_cache(model, &ids, n)` | the O(n²) reference path |
 | `generation::sample_with(&logits, &cfg, &mut rng)` | seeded, reproducible sampling |
 | `Generator::next_token_with(&cfg, &mut rng)` | same, inside the decode loop |
-| `GPT2Model::forward_last` / `forward_with_cache_last` | only the final position's logits, skipping `lm_head` on the rest — what `Generator` and `greedy_no_cache` use internally |
+| `CausalLM::forward_last` / `forward_with_cache_last` | only the final position's logits, skipping the LM head on the rest — what `Generator` and `greedy_no_cache` use internally |
+| `loader::load_with(spec, &dev, Some(Precision::BF16))` | pin the weight dtype |
+| `model.meta()` | layers, q/kv heads, `head_dim`, context, params, KV bytes/token |
 
 Greedy decoding (`temperature <= 1e-6`, no `top_k`/`top_p`) consumes no
 randomness, so every benchmark in this repo is deterministic. For reproducible
@@ -240,8 +314,18 @@ push and PR.
 
 - ~~KV cache~~ — done (`forward_with_cache`, ~11× faster CPU decode, parity-checked)
 - ~~int8 / int4 KV-cache quantization~~ — done (per-token, perplexity + latency + memory ablation)
+- ~~A second architecture~~ — done (Qwen3: RoPE, RMSNorm, GQA, QK-norm, SwiGLU, bf16, sharded checkpoints)
+- **GPU numbers** — the CPU tables stop at 512 tokens because that is where CPU
+  decode becomes unusable, which is also where a KV cache stops being
+  interesting. See [`benchmarks/GPU-RUNBOOK.md`](benchmarks/GPU-RUNBOOK.md).
+- **Confirm the int8 architecture gap on perplexity.** The Qwen3 sensitivity
+  result is currently a single-prompt logit measurement; 60k tokens of
+  WikiText-2 would either confirm it or show it up as an artifact.
+- Pre-RoPE and/or per-channel key quantization — the known fix for the drift
+  that section 8 of the benchmarks measures
+- Preallocated cache buffer (remove the per-step `Tensor::cat` copy)
 - Low-precision attention matmul (turn the memory saving into a peak-RSS + speed win)
-- Verify and benchmark `gpt2-medium/large/xl`
+- Verify and benchmark `gpt2-medium/large/xl`, `Qwen3-1.7B/4B/8B`
 - Batched generation
 
 ## License

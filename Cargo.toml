@@ -40,3 +40,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 rand = "0.10.2"
 dotenvy = "0.15.7"         # maintained fork of the unmaintained `dotenv`
+
+# Integration tests are their own crate, so they need these in scope directly
+# even though the library already depends on them.
+[dev-dependencies]
+candle-core = "0.11.0"
+tokenizers = { version = "0.23.1", features = ["http"] }

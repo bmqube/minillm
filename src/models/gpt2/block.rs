@@ -1,8 +1,10 @@
-use crate::config::GPT2Config;
-use crate::kv_cache::LayerKvCache;
-use crate::{activations::gelu, attention::MultiHeadAttention};
 use candle_core::{Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
+
+use super::attention::MultiHeadAttention;
+use super::config::GPT2Config;
+use crate::kv_cache::LayerKvCache;
+use crate::layers::gelu;
 
 pub struct TransformerBlock {
     ln_1: LayerNorm,
@@ -18,7 +20,7 @@ impl TransformerBlock {
         let attn = MultiHeadAttention::new(cfg, vb.pp("attn"))?;
         let ln_2 = candle_nn::layer_norm(cfg.n_embd, cfg.layer_norm_epsilon, vb.pp("ln_2"))?;
 
-        // Manually load and transpose MLP weights for GPT-2 compatibility
+        // Conv1D-style `[in, out]` weights, as in `attention.rs`.
         let mlp_c_fc_vb = vb.pp("mlp.c_fc");
         let mlp_c_fc_weight = mlp_c_fc_vb
             .get((cfg.n_embd, 4 * cfg.n_embd), "weight")?

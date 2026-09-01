@@ -32,32 +32,35 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let dev = device::best();
     let (model, _tok) = loader::load(&model_id, &dev)?;
+    let model = model.as_ref();
     let ids: Vec<u32> = (0..prefill as u32).collect();
 
     match mode.as_str() {
         "off" => {
-            greedy_no_cache(&model, &dev, &ids, decode)?;
+            greedy_no_cache(model, &ids, decode)?;
         }
         "on" => {
-            greedy(&model, &dev, &ids, decode, kv_quant)?;
+            greedy(model, &ids, decode, kv_quant)?;
         }
         other => return Err(format!("mode must be 'off' or 'on', got {other:?}").into()),
     }
 
     let peak = peak_rss_bytes();
     let seq_end = prefill + decode;
-    let cfg = model.config();
-    let head_dim = cfg.n_embd / cfg.n_head;
+    let meta = model.meta();
+    let precision = model.precision();
     let bpt = if mode == "on" {
-        kv_quant.bytes_per_token(cfg.n_layer, cfg.n_head, head_dim)
+        meta.kv_cache_bytes_per_token_with(kv_quant, precision)
     } else {
-        cfg.kv_cache_bytes_per_token(4)
+        meta.kv_cache_bytes_per_token_at(precision)
     };
     let analytic_kv = bpt * seq_end;
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!(
-        "mode={mode} kv_quant={kv_quant:?} prefill={prefill} decode={decode} seq_end={seq_end} \
+        "model={model_id} arch={} dtype={precision} mode={mode} kv_quant={kv_quant} \
+         prefill={prefill} decode={decode} seq_end={seq_end} \
          peak_rss_bytes={peak} peak_rss_mib={:.1} analytic_kv_mib={:.1}",
+        meta.architecture,
         mib(peak),
         mib(analytic_kv as u64),
     );

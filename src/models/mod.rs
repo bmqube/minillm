@@ -9,9 +9,11 @@
 //! |---|---|---|
 //! | [`gpt2`] | `openai-community/gpt2{,-medium,-large,-xl}` | learned position embeddings, LayerNorm, MHA, tanh-GELU MLP, Conv1D-transposed weights |
 //! | [`qwen3`] | `Qwen/Qwen3-{0.6B,1.7B,4B,8B,14B}` | RoPE, RMSNorm, GQA, per-head QK-norm, SwiGLU MLP |
+//! | [`qwen3_5`] | `Qwen/Qwen3.5-{0.8B,2B,4B,9B,27B}` | hybrid: Gated DeltaNet x3 + gated attention x1, partial RoPE, zero-centred RMSNorm |
 
 pub mod gpt2;
 pub mod qwen3;
+pub mod qwen3_5;
 
 use candle_core::{Device, Result, Tensor};
 
@@ -20,6 +22,7 @@ use crate::kv_cache::{KvCache, KvQuant};
 
 pub use gpt2::GPT2Model;
 pub use qwen3::Qwen3Model;
+pub use qwen3_5::Qwen35Model;
 
 /// Architecture-independent facts about a loaded model.
 ///

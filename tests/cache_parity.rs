@@ -7,17 +7,23 @@
 //! cargo test --test cache_parity -- --ignored
 //! ```
 //!
-//! The GPT-2 cases need `benchmarks/gpt2/`; the Qwen3 cases need
-//! `benchmarks/qwen3-0.6b/`. Each case skips with a message rather than failing
-//! if its checkpoint is absent, so running with one of the two present is fine.
+//! The GPT-2 cases need `benchmarks/gpt2/`, the Qwen3 cases
+//! `benchmarks/qwen3-0.6b/`, and the Qwen3.5 cases `benchmarks/qwen3.5-0.8b/`.
+//! Each case skips with a message rather than failing if its checkpoint is
+//! absent, so running with any subset present is fine.
+//!
+//! For Qwen3.5 the "no cache" reference recomputes every step from a fresh
+//! state, so `cache_matches_no_cache` checks that a recurrent state carried
+//! across steps lands exactly where recomputing it from scratch does.
 
 use minillm::generation::{greedy, greedy_no_cache, Generator};
-use minillm::kv_cache::KvQuant;
+use minillm::kv_cache::{KvQuant, LayerKind};
 use minillm::models::CausalLM;
 use minillm::{device, loader};
 
 const GPT2_DIR: &str = "benchmarks/gpt2";
 const QWEN3_DIR: &str = "benchmarks/qwen3-0.6b";
+const QWEN3_5_DIR: &str = "benchmarks/qwen3.5-0.8b";
 const PROMPT: &str = "A transformer is a deep learning architecture that";
 const STEPS: usize = 32;
 
@@ -97,7 +103,8 @@ fn quantized_caches_stay_close(dir: &str) {
     // Measured drift, prefill on the fixed prompt:
     //
     //   gpt2 124M       int8 0.038 std   int4 0.228 std
-    //   qwen3 0.6B      int8 0.268 std   int4 3.525 std
+    //   qwen3 0.6B      int8 0.268 std   int4 3.525 std   (4.007 under WSL2)
+    //   qwen3.5 0.8B    int8 0.054 std   int4 0.611 std   (WSL2)
     //
     // Qwen3 is ~7x more sensitive to int8 and ~15x more to int4 than GPT-2 —
     // int4 KV genuinely degrades it. The limits below are regression guards set
@@ -194,12 +201,49 @@ fn cache_stores_kv_heads_not_query_heads(dir: &str) {
     let input = candle_core::Tensor::from_vec(ids.clone(), (1, ids.len()), model.device()).unwrap();
     model.forward_with_cache(&input, &mut cache).unwrap();
 
-    let keys = cache.layer(0).keys().unwrap().unwrap();
+    // Layer 0 of a hybrid model is recurrent; check the first attention layer.
+    let first_attention = (0..cache.n_layer())
+        .find(|&i| cache.kind(i) == Some(LayerKind::Attention))
+        .expect("model has at least one attention layer");
+    let keys = cache.layer(first_attention).keys().unwrap().unwrap();
     assert_eq!(
         keys.dims(),
         &[1, meta.n_kv_head, ids.len(), meta.head_dim],
         "{dir}: cached key shape should be [batch, n_kv_head, seq, head_dim]"
     );
+}
+
+/// A recurrent layer's state must not grow with the sequence: the same bytes
+/// after the prompt and after 32 more tokens.
+fn recurrent_state_is_constant_size(dir: &str) {
+    let Some((model, tok)) = load(dir) else {
+        return;
+    };
+    let model = model.as_ref();
+    let ids = tok.encode(PROMPT, true).unwrap().get_ids().to_vec();
+
+    let mut cache = model.new_cache();
+    let recurrent: Vec<usize> = (0..cache.n_layer())
+        .filter(|&i| cache.kind(i) == Some(LayerKind::Recurrent))
+        .collect();
+    assert!(!recurrent.is_empty(), "{dir}: no recurrent layers");
+
+    let input = candle_core::Tensor::from_vec(ids.clone(), (1, ids.len()), model.device()).unwrap();
+    model.forward_with_cache(&input, &mut cache).unwrap();
+    let after_prompt: usize = recurrent.iter().map(|&i| cache.recurrent(i).bytes()).sum();
+
+    for step in 0..STEPS as u32 {
+        let next = candle_core::Tensor::from_vec(vec![step + 10], (1, 1), model.device()).unwrap();
+        model.forward_with_cache(&next, &mut cache).unwrap();
+    }
+    let after_decode: usize = recurrent.iter().map(|&i| cache.recurrent(i).bytes()).sum();
+
+    assert!(after_prompt > 0);
+    assert_eq!(
+        after_prompt, after_decode,
+        "{dir}: recurrent state grew from {after_prompt} to {after_decode} bytes"
+    );
+    assert_eq!(cache.len(), ids.len() + STEPS, "{dir}: position count");
 }
 
 #[test]
@@ -248,4 +292,34 @@ fn qwen3_incremental_prefill_matches_bulk() {
 #[ignore = "requires benchmarks/qwen3-0.6b weights on disk"]
 fn qwen3_cache_stores_kv_heads_not_query_heads() {
     cache_stores_kv_heads_not_query_heads(QWEN3_DIR);
+}
+
+#[test]
+#[ignore = "requires benchmarks/qwen3.5-0.8b weights on disk"]
+fn qwen3_5_cache_matches_no_cache() {
+    cache_matches_no_cache(QWEN3_5_DIR);
+}
+
+#[test]
+#[ignore = "requires benchmarks/qwen3.5-0.8b weights on disk"]
+fn qwen3_5_quantized_caches_stay_close() {
+    quantized_caches_stay_close(QWEN3_5_DIR);
+}
+
+#[test]
+#[ignore = "requires benchmarks/qwen3.5-0.8b weights on disk"]
+fn qwen3_5_incremental_prefill_matches_bulk() {
+    incremental_prefill_matches_bulk(QWEN3_5_DIR);
+}
+
+#[test]
+#[ignore = "requires benchmarks/qwen3.5-0.8b weights on disk"]
+fn qwen3_5_cache_stores_kv_heads_not_query_heads() {
+    cache_stores_kv_heads_not_query_heads(QWEN3_5_DIR);
+}
+
+#[test]
+#[ignore = "requires benchmarks/qwen3.5-0.8b weights on disk"]
+fn qwen3_5_recurrent_state_is_constant_size() {
+    recurrent_state_is_constant_size(QWEN3_5_DIR);
 }

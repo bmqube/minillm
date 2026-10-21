@@ -14,6 +14,7 @@
 
 use candle_core::{Device, IndexOp, Result, Tensor};
 use rand::{Rng, RngExt};
+use tokenizers::Tokenizer;
 
 use crate::kv_cache::{KvCache, KvQuant};
 use crate::models::CausalLM;
@@ -64,6 +65,11 @@ pub fn sample_with<R: Rng + ?Sized>(
         return greedy_id(logits);
     }
     let mut logits = last_step_logits(logits)?;
+    if logits.iter().any(|l| l.is_nan()) {
+        return Err(candle_core::Error::Msg(
+            "sample: logits contain NaN (usually an fp16 overflow; try bf16 or f32)".into(),
+        ));
+    }
 
     // Temperature.
     if (cfg.temperature - 1.0).abs() > f64::EPSILON {
@@ -74,8 +80,6 @@ pub fn sample_with<R: Rng + ?Sized>(
     }
 
     // Rank tokens by descending logit; top-k / top-p slice this order.
-    // `total_cmp` keeps the order total even if a logit is NaN, which the sort
-    // is allowed to panic on otherwise.
     let desc = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
     let mut ranked: Vec<usize> = (0..logits.len()).collect();
 
@@ -179,6 +183,46 @@ fn argmax(v: &[f32]) -> usize {
     best
 }
 
+/// Turns generated token ids into printable text, one call per token.
+///
+/// Byte-level BPE (GPT-2, Qwen) can split one character across several tokens,
+/// so decoding token by token prints `�` for each piece. This decodes the whole
+/// completion so far and hands back only the new text, holding it back while it
+/// still ends in an incomplete character.
+pub struct TextStream<'t> {
+    tokenizer: &'t Tokenizer,
+    ids: Vec<u32>,
+    printed: usize,
+}
+
+impl<'t> TextStream<'t> {
+    pub fn new(tokenizer: &'t Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            ids: Vec::new(),
+            printed: 0,
+        }
+    }
+
+    /// Add `id` and return the text it completes; empty while a character is
+    /// still incomplete.
+    pub fn push(&mut self, id: u32) -> tokenizers::Result<String> {
+        self.ids.push(id);
+        let text = self.tokenizer.decode(&self.ids, false)?;
+        if text.ends_with('\u{FFFD}') {
+            return Ok(String::new());
+        }
+        let new = text.get(self.printed..).unwrap_or_default().to_string();
+        self.printed = text.len();
+        Ok(new)
+    }
+
+    /// Every id pushed so far.
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+}
+
 /// Greedy sampling: pure argmax, no randomness.
 pub const GREEDY: SamplingConfig = SamplingConfig {
     temperature: 0.0,
@@ -194,17 +238,17 @@ pub const GREEDY: SamplingConfig = SamplingConfig {
 ///
 /// ```no_run
 /// # use minillm::{device, loader};
-/// # use minillm::generation::{Generator, GREEDY};
+/// # use minillm::generation::{Generator, TextStream, GREEDY};
 /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// let dev = device::best();
 /// let (model, tok) = loader::load("openai-community/gpt2", &dev)?;
-/// let ids = tok.encode("Hello", true).unwrap().get_ids().to_vec();
+/// let ids = tok.encode("Hello", true)?.get_ids().to_vec();
 ///
 /// let mut gen = Generator::new(model.as_ref());
+/// let mut text = TextStream::new(&tok);
 /// gen.prefill(&ids)?;
 /// for _ in 0..20 {
-///     let id = gen.next_token(&GREEDY)?;
-///     print!("{}", tok.decode(&[id], false).unwrap());
+///     print!("{}", text.push(gen.next_token(&GREEDY)?)?);
 /// }
 /// # Ok(())
 /// # }
@@ -407,14 +451,38 @@ mod tests {
     }
 
     #[test]
-    fn nan_logits_do_not_panic() {
+    fn nan_logits_are_an_error_not_a_silent_token() {
         let t = logits(&[0.5, f32::NAN, 1.0, f32::NAN]);
         let cfg = SamplingConfig {
             temperature: 0.7,
-            top_k: Some(2),
-            top_p: Some(0.9),
+            top_k: None,
+            top_p: None,
         };
-        assert!(sample(&t, &cfg).unwrap() < 4);
+        let err = sample(&t, &cfg).unwrap_err().to_string();
+        assert!(err.contains("NaN"), "{err}");
+    }
+
+    #[test]
+    fn text_stream_holds_back_a_split_character() {
+        // Byte-level vocabulary for the three UTF-8 bytes of '’' (E2 80 99),
+        // one token each, plus "a".
+        let json = r#"{
+          "version": "1.0", "truncation": null, "padding": null,
+          "added_tokens": [], "normalizer": null, "pre_tokenizer": null,
+          "post_processor": null,
+          "decoder": {"type": "ByteLevel", "add_prefix_space": false,
+                      "trim_offsets": true, "use_regex": true},
+          "model": {"type": "WordLevel", "unk_token": "a",
+                    "vocab": {"a": 0, "\u00e2": 1, "\u0122": 2, "\u013b": 3}}
+        }"#;
+        let tok: Tokenizer = json.parse().unwrap();
+        let mut s = TextStream::new(&tok);
+        assert_eq!(s.push(0).unwrap(), "a");
+        assert_eq!(s.push(1).unwrap(), "");
+        assert_eq!(s.push(2).unwrap(), "");
+        assert_eq!(s.push(3).unwrap(), "\u{2019}");
+        assert_eq!(s.push(0).unwrap(), "a");
+        assert_eq!(s.ids(), &[0, 1, 2, 3, 0]);
     }
 
     #[test]

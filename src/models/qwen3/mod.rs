@@ -45,5 +45,5 @@ mod model;
 
 pub use attention::Qwen3Attention;
 pub use block::Qwen3Block;
-pub use config::Qwen3Config;
+pub use config::{Qwen3Config, RopeParameters};
 pub use model::Qwen3Model;

@@ -47,10 +47,27 @@ pub struct Qwen3Config {
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
     /// RoPE scaling (YaRN for long context, per Qwen's own instructions). Not
-    /// implemented: [`Qwen3Model::new`](super::Qwen3Model::new) refuses a
-    /// config that sets it rather than run unscaled RoPE.
+    /// implemented: [`plain_rope_theta`](Self::plain_rope_theta) refuses it
+    /// rather than let the model run unscaled RoPE.
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
+    /// Transformers v5 keeps `rope_theta` and the scaling type here instead of
+    /// at the top level.
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
+}
+
+/// The `rope_parameters` block of a Transformers v5 config.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+    #[serde(default = "default_rope_type")]
+    pub rope_type: String,
+}
+
+fn default_rope_type() -> String {
+    "default".to_string()
 }
 
 fn default_rope_theta() -> f64 {
@@ -86,6 +103,25 @@ impl Qwen3Config {
             self.sliding_window.filter(|w| *w > 0)
         } else {
             None
+        }
+    }
+
+    /// The RoPE base to use, or an error if the config asks for RoPE scaling
+    /// (in either the legacy `rope_scaling` key or v5 `rope_parameters`), which
+    /// this crate does not implement.
+    pub fn plain_rope_theta(&self) -> Result<f64, String> {
+        if let Some(scaling) = &self.rope_scaling {
+            return Err(format!(
+                "unsupported rope_scaling {scaling}: only plain RoPE is implemented"
+            ));
+        }
+        match &self.rope_parameters {
+            Some(p) if p.rope_type != "default" => Err(format!(
+                "unsupported rope_type {:?}: only plain RoPE is implemented",
+                p.rope_type
+            )),
+            Some(p) => Ok(p.rope_theta.unwrap_or(self.rope_theta)),
+            None => Ok(self.rope_theta),
         }
     }
 
@@ -246,6 +282,33 @@ mod tests {
 
         c.use_sliding_window = true;
         assert_eq!(c.effective_sliding_window(), Some(4096));
+    }
+
+    #[test]
+    fn rope_scaling_is_refused_in_either_layout() {
+        assert_eq!(cfg().plain_rope_theta(), Ok(1_000_000.0));
+
+        let legacy = qwen3_0_6b_json().replace(
+            "\"rope_scaling\": null",
+            "\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 4.0}",
+        );
+        let c: Qwen3Config = serde_json::from_str(&legacy).unwrap();
+        assert!(c.plain_rope_theta().is_err());
+
+        let v5 = qwen3_0_6b_json().replace(
+            "\"rope_scaling\": null",
+            "\"rope_parameters\": {\"rope_type\": \"yarn\", \"rope_theta\": 1e6}",
+        );
+        let c: Qwen3Config = serde_json::from_str(&v5).unwrap();
+        assert!(c.plain_rope_theta().is_err());
+
+        // A plain v5 block supplies the theta.
+        let v5 = qwen3_0_6b_json().replace(
+            "\"rope_scaling\": null",
+            "\"rope_parameters\": {\"rope_type\": \"default\", \"rope_theta\": 5e5}",
+        );
+        let c: Qwen3Config = serde_json::from_str(&v5).unwrap();
+        assert_eq!(c.plain_rope_theta(), Ok(500_000.0));
     }
 
     #[test]

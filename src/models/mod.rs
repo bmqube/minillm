@@ -70,7 +70,12 @@ impl ModelMeta {
     /// the *key/value* head count times the head width. Under GQA this is
     /// `n_kv_groups()` times smaller than the naive `n_head`-based figure.
     pub fn kv_cache_bytes_per_token(&self, bytes_per_elem: usize) -> usize {
-        2 * self.n_kv_layers * self.n_kv_head * self.head_dim * bytes_per_elem
+        KvQuant::None.bytes_per_token(
+            self.n_kv_layers,
+            self.n_kv_head,
+            self.head_dim,
+            bytes_per_elem,
+        )
     }
 
     /// [`kv_cache_bytes_per_token`](Self::kv_cache_bytes_per_token) for a

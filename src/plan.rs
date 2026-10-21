@@ -64,7 +64,7 @@ impl ExecutionPlan {
         let threads = overrides
             .threads
             .or(from_env)
-            .unwrap_or_else(num_cpus::get_physical)
+            .unwrap_or_else(crate::hardware::usable_physical_cores)
             .max(1);
         // Single-threaded here: no other thread can be reading the environment.
         std::env::set_var("RAYON_NUM_THREADS", threads.to_string());

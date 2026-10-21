@@ -107,6 +107,9 @@ impl Qwen35Config {
             cfg.tie_word_embeddings |= tie;
         }
         if cfg.layer_types.is_empty() {
+            if cfg.full_attention_interval == 0 {
+                return Err("full_attention_interval must be at least 1".into());
+            }
             cfg.layer_types = (0..cfg.num_hidden_layers)
                 .map(|i| {
                     if (i + 1) % cfg.full_attention_interval == 0 {
@@ -160,17 +163,19 @@ impl Qwen35Config {
         Ok(())
     }
 
+    /// What layer `i` keeps between decode steps.
+    pub fn layer_kind(&self, i: usize) -> LayerKind {
+        if self.layer_types[i] == "full_attention" {
+            LayerKind::Attention
+        } else {
+            LayerKind::Recurrent
+        }
+    }
+
     /// What each layer keeps between decode steps.
     pub fn layer_kinds(&self) -> Vec<LayerKind> {
-        self.layer_types
-            .iter()
-            .map(|t| {
-                if t == "full_attention" {
-                    LayerKind::Attention
-                } else {
-                    LayerKind::Recurrent
-                }
-            })
+        (0..self.num_hidden_layers)
+            .map(|i| self.layer_kind(i))
             .collect()
     }
 
@@ -345,6 +350,17 @@ mod tests {
             }
             v
         });
+    }
+
+    #[test]
+    fn a_zero_attention_interval_is_an_error_not_a_panic() {
+        let json = qwen3_5_0_8b_json()
+            .replace("\"layer_types\"", "\"unused_layer_types\"")
+            .replace(
+                "\"full_attention_interval\": 4",
+                "\"full_attention_interval\": 0",
+            );
+        assert!(Qwen35Config::from_json(&json).is_err());
     }
 
     #[test]

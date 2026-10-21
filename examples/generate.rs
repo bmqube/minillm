@@ -6,6 +6,7 @@
 
 use minillm::generation::{Generator, SamplingConfig};
 use minillm::{device, loader};
+use std::io::Write;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
@@ -29,12 +30,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     generator.prefill(&ids)?;
 
     print!("{prompt}");
-    for _ in 0..40 {
+    // Each step feeds the token it returns, so stop while that still fits.
+    let steps = 40.min(model.meta().n_ctx.saturating_sub(ids.len()));
+    let mut out: Vec<u32> = Vec::new();
+    let mut printed = 0;
+    for _ in 0..steps {
         let next = generator.next_token(&cfg)?;
         if next == eot {
             break;
         }
-        print!("{}", tokenizer.decode(&[next], false)?);
+        out.push(next);
+        // One character can span several byte-level tokens: print the decoded
+        // tail only once it is whole.
+        let text = tokenizer.decode(&out, false)?;
+        if !text.ends_with('\u{FFFD}') {
+            print!("{}", text.get(printed..).unwrap_or_default());
+            std::io::stdout().flush()?;
+            printed = text.len();
+        }
     }
     println!();
     Ok(())

@@ -26,9 +26,11 @@
 //!
 //! # Not exercised
 //!
-//! `sliding_window` / `use_sliding_window` are read and honoured, but every
-//! released dense Qwen3 ships `use_sliding_window: false`, so the windowed path
-//! has no end-to-end coverage — only the mask itself is unit-tested. It exists
+//! `sliding_window` / `use_sliding_window` / `max_window_layers` /
+//! `layer_types` are read and honoured per layer, as Transformers does, but
+//! every released dense Qwen3 ships `use_sliding_window: false` (and
+//! `max_window_layers` equal to the layer count), so the windowed path has no
+//! end-to-end coverage — only the mask and the per-layer choice are unit-tested. It exists
 //! so a checkpoint that enables windowing is not silently run with full causal
 //! attention; treat it as untested until one is.
 //!

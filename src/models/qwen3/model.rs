@@ -1,12 +1,12 @@
-use candle_core::{Device, IndexOp, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, RmsNorm, VarBuilder};
 
 use super::block::Qwen3Block;
 use super::config::Qwen3Config;
 use crate::dtype::Precision;
-use crate::kv_cache::KvCache;
+use crate::kv_cache::{KvCache, LayerKind};
 use crate::layers::{mask, RotaryEmbedding};
-use crate::models::{check_cache, CausalLM, ModelMeta};
+use crate::models::{check_cache, last_position_logits, CausalLM, ModelMeta};
 
 pub struct Qwen3Model {
     cfg: Qwen3Config,
@@ -18,7 +18,10 @@ pub struct Qwen3Model {
     norm: RmsNorm,
     lm_head: Linear,
     rope: RotaryEmbedding,
-    sliding_window: Option<usize>,
+    /// The sliding-window span, when at least one layer uses it.
+    window: Option<usize>,
+    /// Per layer: whether it attends through the window rather than globally.
+    sliding: Vec<bool>,
 }
 
 impl Qwen3Model {
@@ -44,6 +47,11 @@ impl Qwen3Model {
             return Err(candle_core::Error::Msg(format!(
                 "num_attention_heads ({}) must be a multiple of num_key_value_heads ({})",
                 cfg.num_attention_heads, cfg.num_key_value_heads
+            )));
+        }
+        if let Some(scaling) = &cfg.rope_scaling {
+            return Err(candle_core::Error::Msg(format!(
+                "unsupported rope_scaling {scaling}: only plain RoPE is implemented"
             )));
         }
 
@@ -92,43 +100,38 @@ impl Qwen3Model {
             norm,
             lm_head,
             rope,
-            sliding_window: cfg.effective_sliding_window(),
+            window: (0..cfg.num_hidden_layers).find_map(|i| cfg.sliding_window_for(i)),
+            sliding: (0..cfg.num_hidden_layers)
+                .map(|i| cfg.sliding_window_for(i).is_some())
+                .collect(),
         })
     }
 
-    /// Build the additive attention mask for a step, or `None` when none is
-    /// needed.
+    /// The step's additive attention masks, `(global, windowed)`; `None` where
+    /// none is needed.
     ///
     /// A single new query under full causal attention is the newest position and
     /// may attend to everything cached, so it needs no mask — the common decode
     /// case skips the allocation and the `broadcast_add` entirely. With a sliding
     /// window even a single query needs a mask, because it must *not* see the
     /// oldest cached keys.
-    fn build_mask(
+    fn build_masks(
         &self,
         seq_len: usize,
         total: usize,
         past: usize,
         dtype: candle_core::DType,
-    ) -> Result<Option<Tensor>> {
-        match self.sliding_window {
-            None if seq_len == 1 => Ok(None),
-            None => Ok(Some(mask::causal(
-                seq_len,
-                total,
-                past,
-                dtype,
-                &self.device,
-            )?)),
-            Some(window) => Ok(Some(mask::causal_sliding(
-                seq_len,
-                total,
-                past,
-                window,
-                dtype,
-                &self.device,
-            )?)),
-        }
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let global = if seq_len == 1 {
+            None
+        } else {
+            Some(mask::causal(seq_len, total, past, dtype, &self.device)?)
+        };
+        let windowed = self
+            .window
+            .map(|w| mask::causal_sliding(seq_len, total, past, w, dtype, &self.device))
+            .transpose()?;
+        Ok((global, windowed))
     }
 
     /// Embeddings through every block and the final RMSNorm — everything
@@ -143,8 +146,9 @@ impl Qwen3Model {
         }
 
         let mut hidden = input_ids.apply(&self.embed_tokens)?;
-        let m = self.build_mask(seq_len, seq_len, 0, hidden.dtype())?;
-        for block in &self.blocks {
+        let (global, windowed) = self.build_masks(seq_len, seq_len, 0, hidden.dtype())?;
+        for (block, &sliding) in self.blocks.iter().zip(&self.sliding) {
+            let m = if sliding { &windowed } else { &global };
             hidden = block.forward(&hidden, m.as_ref(), &self.rope)?;
         }
         hidden.apply(&self.norm)
@@ -160,13 +164,15 @@ impl Qwen3Model {
         let (past, total) = check_cache(
             cache,
             self.blocks.len(),
+            |_| LayerKind::Attention,
             seq_len,
             self.cfg.max_position_embeddings,
         )?;
 
         let mut hidden = input_ids.apply(&self.embed_tokens)?;
-        let m = self.build_mask(seq_len, total, past, hidden.dtype())?;
+        let (global, windowed) = self.build_masks(seq_len, total, past, hidden.dtype())?;
         for (i, block) in self.blocks.iter().enumerate() {
+            let m = if self.sliding[i] { &windowed } else { &global };
             hidden =
                 block.forward_with_cache(&hidden, m.as_ref(), cache.layer(i), past, &self.rope)?;
         }
@@ -192,9 +198,7 @@ impl CausalLM for Qwen3Model {
     }
 
     fn forward_last(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let hidden = self.hidden_states(input_ids)?;
-        let last = hidden.dim(1)? - 1;
-        hidden.i((.., last, ..))?.apply(&self.lm_head)
+        last_position_logits(&self.hidden_states(input_ids)?, &self.lm_head)
     }
 
     fn forward_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
@@ -204,7 +208,6 @@ impl CausalLM for Qwen3Model {
 
     fn forward_with_cache_last(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         let hidden = self.hidden_states_with_cache(input_ids, cache)?;
-        let last = hidden.dim(1)? - 1;
-        hidden.i((.., last, ..))?.apply(&self.lm_head)
+        last_position_logits(&hidden, &self.lm_head)
     }
 }

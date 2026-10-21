@@ -16,7 +16,7 @@
 //! This is the quick single-config smoke test — `sweep` is the data generator
 //! (multiple sequence lengths, quantization modes, and repeats).
 
-use candle_core::{IndexOp, Tensor};
+use candle_core::{DType, IndexOp, Tensor};
 use minillm::generation::{greedy_no_cache, Generator, GREEDY};
 use minillm::{loader, ExecutionPlan};
 use std::time::Instant;
@@ -71,7 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Warm-up: triggers lazy allocation / kernel selection.
     let warm = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-    let _ = model.forward_last(&warm)?.i(0)?.to_vec1::<f32>()?;
+    let _ = model
+        .forward_last(&warm)?
+        .i(0)?
+        .to_dtype(DType::F32)?
+        .to_vec1::<f32>()?;
 
     // Prefill: full forward pass over the prompt, only the final position's
     // logits kept (via `forward_last`) — this is what a real decode session
@@ -79,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let t1 = Instant::now();
     let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
     let logits = model.forward_last(&input)?;
-    let _ = logits.i(0)?.to_vec1::<f32>()?; // force realisation
+    let _ = logits.i(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?; // force realisation
     let prefill_s = t1.elapsed().as_secs_f64();
     println!(
         "prefill        : {:.1} ms ({:.1} tok/s)",

@@ -9,8 +9,8 @@
 //! feed one token per step. Use [`sample_with`] (and
 //! [`Generator::next_token_with`]) with a seeded RNG when a run has to be
 //! reproducible; the plain [`sample`] draws from the thread RNG. Greedy decoding
-//! (`temperature <= 1e-6`, no `top_k`/`top_p`) consumes no randomness at all, so
-//! every benchmark in this crate is deterministic regardless.
+//! (`temperature <= 1e-6`) consumes no randomness at all, so every benchmark in
+//! this crate is deterministic regardless.
 
 use candle_core::{Device, IndexOp, Result, Tensor};
 use rand::{Rng, RngExt};
@@ -58,48 +58,38 @@ pub fn sample_with<R: Rng + ?Sized>(
     cfg: &SamplingConfig,
     rng: &mut R,
 ) -> Result<u32> {
-    let greedy = cfg.temperature <= 1e-6;
-
-    // Fast path: pure argmax, on the logits' own device.
-    if greedy && cfg.top_k.is_none() && cfg.top_p.is_none() {
+    // Greedy: top-k and top-p both keep the highest-ranked token, so neither
+    // can change the argmax. Take it on the logits' own device.
+    if cfg.temperature <= 1e-6 {
         return greedy_id(logits);
     }
     let mut logits = last_step_logits(logits)?;
 
     // Temperature.
-    if !greedy && (cfg.temperature - 1.0).abs() > f64::EPSILON {
+    if (cfg.temperature - 1.0).abs() > f64::EPSILON {
         let t = cfg.temperature as f32;
         for l in logits.iter_mut() {
             *l /= t;
         }
     }
 
-    // Rank tokens once by descending logit; top-k / top-p slice this order.
+    // Rank tokens by descending logit; top-k / top-p slice this order.
+    // `total_cmp` keeps the order total even if a logit is NaN, which the sort
+    // is allowed to panic on otherwise.
+    let desc = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
     let mut ranked: Vec<usize> = (0..logits.len()).collect();
-    ranked.sort_unstable_by(|&a, &b| {
-        logits[b]
-            .partial_cmp(&logits[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
 
-    // top-k: keep at most k candidates.
-    let mut keep = ranked.len();
-    if let Some(k) = cfg.top_k {
-        if k > 0 {
-            keep = keep.min(k);
-        }
+    // top-k: partition out the k best first, so only those get sorted rather
+    // than the whole vocabulary (152k entries on Qwen3) every step.
+    if let Some(k) = cfg.top_k.filter(|&k| k > 0 && k < ranked.len()) {
+        ranked.select_nth_unstable_by(k - 1, desc);
+        ranked.truncate(k);
     }
-    let candidates = &ranked[..keep];
+    ranked.sort_unstable_by(desc);
 
-    // Numerically stable softmax over the kept logits.
-    let max_l = candidates
-        .iter()
-        .map(|&i| logits[i])
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = candidates
-        .iter()
-        .map(|&i| (logits[i] - max_l).exp())
-        .collect();
+    // Numerically stable softmax over the kept logits; `ranked[0]` is the max.
+    let max_l = logits[ranked[0]];
+    let mut probs: Vec<f32> = ranked.iter().map(|&i| (logits[i] - max_l).exp()).collect();
     normalize(&mut probs);
 
     // top-p (nucleus): truncate to the shortest prefix reaching mass p.
@@ -118,11 +108,6 @@ pub fn sample_with<R: Rng + ?Sized>(
         normalize(&mut probs);
     }
 
-    // Temperature drove us to greedy but filters are active: argmax the survivors.
-    if greedy {
-        return Ok(ranked[argmax(&probs)] as u32);
-    }
-
     // Sample from the categorical distribution over the ranked survivors.
     let r: f32 = rng.random::<f32>();
     let mut cum = 0.0f32;
@@ -135,32 +120,17 @@ pub fn sample_with<R: Rng + ?Sized>(
     Ok(ranked[probs.len().saturating_sub(1)] as u32)
 }
 
-/// Backwards-compatible wrapper. Prefer [`sample`] with a [`SamplingConfig`].
-pub fn generate_token(
-    logits: &Tensor,
-    temperature: f64,
-    top_k: Option<usize>,
-    top_p: Option<f64>,
-) -> Result<u32> {
-    sample(
-        logits,
-        &SamplingConfig {
-            temperature,
-            top_k,
-            top_p,
-        },
-    )
-}
-
 /// The final position's logits row (batch index 0), still on its device.
 fn last_step_row(logits: &Tensor) -> Result<Tensor> {
     match logits.dims().len() {
         1 => Ok(logits.clone()),
         2 => logits.i(0),
-        3 => {
-            let seq_len = logits.dims()[1];
-            logits.i((0, seq_len - 1))
-        }
+        3 => match logits.dims()[1] {
+            0 => Err(candle_core::Error::Msg(
+                "sample: logits have no positions".into(),
+            )),
+            seq_len => logits.i((0, seq_len - 1)),
+        },
         n => Err(candle_core::Error::Msg(format!(
             "sample: expected logits of rank 1-3, got rank {n}"
         ))),
@@ -409,6 +379,42 @@ mod tests {
         for _ in 0..25 {
             assert_eq!(sample(&t, &cfg).unwrap(), 2);
         }
+    }
+
+    #[test]
+    fn greedy_ignores_top_k_and_top_p() {
+        let t = logits(&[0.1, 0.2, 5.0, 0.2]);
+        let cfg = SamplingConfig {
+            temperature: 0.0,
+            top_k: Some(3),
+            top_p: Some(0.5),
+        };
+        assert_eq!(sample(&t, &cfg).unwrap(), 2);
+    }
+
+    #[test]
+    fn top_k_only_draws_from_the_k_best() {
+        let t = logits(&[0.0, 3.0, -1.0, 2.9, 0.5, 2.8]);
+        let cfg = SamplingConfig {
+            temperature: 1.0,
+            top_k: Some(3),
+            top_p: None,
+        };
+        for _ in 0..200 {
+            let id = sample(&t, &cfg).unwrap();
+            assert!([1, 3, 5].contains(&id), "drew {id}, outside the top 3");
+        }
+    }
+
+    #[test]
+    fn nan_logits_do_not_panic() {
+        let t = logits(&[0.5, f32::NAN, 1.0, f32::NAN]);
+        let cfg = SamplingConfig {
+            temperature: 0.7,
+            top_k: Some(2),
+            top_p: Some(0.9),
+        };
+        assert!(sample(&t, &cfg).unwrap() < 4);
     }
 
     #[test]

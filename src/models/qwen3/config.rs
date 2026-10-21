@@ -38,6 +38,19 @@ pub struct Qwen3Config {
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub use_sliding_window: bool,
+    /// With windowing on, layers `max_window_layers..` use the window and the
+    /// ones below it attend globally — unless `layer_types` says otherwise.
+    #[serde(default = "default_max_window_layers")]
+    pub max_window_layers: usize,
+    /// Per layer, `"full_attention"` or `"sliding_attention"`. Overrides
+    /// `max_window_layers` when present.
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    /// RoPE scaling (YaRN for long context, per Qwen's own instructions). Not
+    /// implemented: [`Qwen3Model::new`](super::Qwen3Model::new) refuses a
+    /// config that sets it rather than run unscaled RoPE.
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
 }
 
 fn default_rope_theta() -> f64 {
@@ -50,6 +63,11 @@ fn default_rms_norm_eps() -> f64 {
 
 fn default_hidden_act() -> String {
     "silu".to_string()
+}
+
+/// Transformers' default, and what every released dense Qwen3 sets.
+fn default_max_window_layers() -> usize {
+    28
 }
 
 impl Qwen3Config {
@@ -69,6 +87,20 @@ impl Qwen3Config {
         } else {
             None
         }
+    }
+
+    /// Sliding-window span for `layer`, or `None` if it attends globally.
+    ///
+    /// Follows Transformers: `layer_types` when the config has it, otherwise
+    /// layers from `max_window_layers` on. Released checkpoints set that to the
+    /// layer count, so even with windowing switched on no layer uses it.
+    pub fn sliding_window_for(&self, layer: usize) -> Option<usize> {
+        let window = self.effective_sliding_window()?;
+        let sliding = match &self.layer_types {
+            Some(types) => types.get(layer).is_some_and(|t| t == "sliding_attention"),
+            None => layer >= self.max_window_layers,
+        };
+        sliding.then_some(window)
     }
 
     /// Analytic parameter count.
@@ -214,6 +246,27 @@ mod tests {
 
         c.use_sliding_window = true;
         assert_eq!(c.effective_sliding_window(), Some(4096));
+    }
+
+    #[test]
+    fn sliding_window_applies_only_from_max_window_layers() {
+        let mut c = cfg();
+        c.sliding_window = Some(4096);
+        c.use_sliding_window = true;
+        // The released config: max_window_layers = 28 = num_hidden_layers, so
+        // no layer is windowed even with the flag on.
+        assert!((0..28).all(|i| c.sliding_window_for(i).is_none()));
+
+        c.max_window_layers = 20;
+        assert_eq!(c.sliding_window_for(19), None);
+        assert_eq!(c.sliding_window_for(20), Some(4096));
+
+        // An explicit layer_types wins over max_window_layers.
+        let mut types = vec!["full_attention".to_string(); 28];
+        types[3] = "sliding_attention".to_string();
+        c.layer_types = Some(types);
+        assert_eq!(c.sliding_window_for(3), Some(4096));
+        assert_eq!(c.sliding_window_for(20), None);
     }
 
     #[test]

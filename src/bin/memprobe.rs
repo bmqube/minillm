@@ -6,10 +6,10 @@
 //!
 //! Defaults: `on 512 128 benchmarks/gpt2 none`. Loads the model, runs a greedy
 //! decode loop in the chosen path (`off` = full recompute, `on` = KV cache with
-//! `KVQUANT` storage `none`|`int8`), then prints this process's peak RSS. Run it
+//! `KVQUANT` storage `none`|`int8`|`int4`), then prints this process's peak RSS. Run it
 //! once per mode with the **same** `PREFILL` / `DECODE` and diff the two peaks to
 //! get the cache's real memory cost — which includes the transient dequant to
-//! fp32 each step, so it runs above the steady-state analytic figure.
+//! the model precision each step, so it runs above the steady-state analytic figure.
 //!
 //! One process = one mode on purpose: `bench` runs both paths, so its peak would
 //! just be the larger of the two.

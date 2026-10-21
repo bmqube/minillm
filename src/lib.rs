@@ -8,9 +8,9 @@
 //!
 //! | Module | What lives there |
 //! |---|---|
-//! | [`models`] | The [`CausalLM`] trait and one module per architecture ([`models::gpt2`], [`models::qwen3`]) |
-//! | [`layers`] | Primitives shared between architectures: activations, masks, RoPE, GQA head expansion |
-//! | [`kv_cache`] | The decode-time key/value store and its quantization modes |
+//! | [`models`] | The [`CausalLM`] trait and one module per architecture ([`models::gpt2`], [`models::qwen3`], [`models::qwen3_5`]) |
+//! | [`layers`] | Primitives shared between architectures: activations, masks, RoPE, grouped-query attention |
+//! | [`kv_cache`] | The decode-time key/value store and its quantization modes, plus recurrent state for hybrid models |
 //! | [`generation`] | Sampling and the [`Generator`](generation::Generator) decode loop |
 //! | [`loader`] | Config parsing, architecture dispatch, sharded safetensors |
 //! | [`dtype`] | Compute [`Precision`] selection |

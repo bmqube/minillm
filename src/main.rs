@@ -10,6 +10,7 @@
 
 use minillm::generation::{Generator, SamplingConfig};
 use minillm::{loader, ExecutionPlan};
+use std::io::Write;
 use std::time::Instant;
 
 const DEFAULT_MODEL: &str = "openai-community/gpt2";
@@ -38,9 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let ids = tokenizer.encode(prompt.as_str(), true)?.get_ids().to_vec();
-    let max_new_tokens = 50;
-    // GPT-2 ends on <|endoftext|>; Qwen3 on <|im_end|>. Neither is present in
-    // the other's vocabulary, so looking up both is safe.
+    // Each step feeds the token it returns, so stop while that still fits.
+    let max_new_tokens = 50.min(meta.n_ctx.saturating_sub(ids.len()));
+    // Stop on whichever end markers this tokenizer has: GPT-2 ends on
+    // <|endoftext|>, Qwen chat models on <|im_end|>.
     let stops: Vec<u32> = ["<|endoftext|>", "<|im_end|>"]
         .iter()
         .filter_map(|t| tokenizer.token_to_id(t))
@@ -59,16 +61,25 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     generator.prefill(&ids)?;
 
     let start = Instant::now();
-    let mut generated = 0usize;
+    let mut out: Vec<u32> = Vec::new();
+    let mut printed = 0usize;
     for _ in 0..max_new_tokens {
         let next = generator.next_token(&cfg)?;
         if stops.contains(&next) {
             break;
         }
-        print!("{}", tokenizer.decode(&[next], false)?);
-        generated += 1;
+        out.push(next);
+        // Byte-level BPE can split one character across tokens, so decode the
+        // whole completion and print the new tail once it is whole.
+        let text = tokenizer.decode(&out, false)?;
+        if !text.ends_with('\u{FFFD}') {
+            print!("{}", text.get(printed..).unwrap_or_default());
+            std::io::stdout().flush()?;
+            printed = text.len();
+        }
     }
     println!();
+    let generated = out.len();
 
     let secs = start.elapsed().as_secs_f64();
     if generated > 0 {

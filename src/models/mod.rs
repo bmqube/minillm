@@ -15,10 +15,11 @@ pub mod gpt2;
 pub mod qwen3;
 pub mod qwen3_5;
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, IndexOp, Module, Result, Tensor};
+use candle_nn::Linear;
 
 use crate::dtype::Precision;
-use crate::kv_cache::{KvCache, KvQuant};
+use crate::kv_cache::{KvCache, KvQuant, LayerKind};
 
 pub use gpt2::GPT2Model;
 pub use qwen3::Qwen3Model;
@@ -133,6 +134,9 @@ pub trait CausalLM: Send + Sync {
     /// Pass the whole prompt on the first call (prefill), then one token per
     /// step. With an empty cache and the full sequence this computes exactly what
     /// [`forward`](Self::forward) does.
+    ///
+    /// On error the cache may be left part-way through the step (some layers
+    /// extended, others not); [`reset`](KvCache::reset) it before reusing it.
     fn forward_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor>;
 
     /// [`forward_with_cache`](Self::forward_with_cache) with the LM head applied
@@ -153,10 +157,12 @@ pub trait CausalLM: Send + Sync {
 }
 
 /// Shared prologue for the cached forward paths: validate the cache against the
-/// model and return `(past_len, total_len)`.
+/// model's layer layout (`kind(i)` is what layer `i` keeps) and return
+/// `(past_len, total_len)`.
 pub(crate) fn check_cache(
     cache: &KvCache,
     n_layer: usize,
+    kind: impl Fn(usize) -> LayerKind,
     seq_len: usize,
     n_ctx: usize,
 ) -> Result<(usize, usize)> {
@@ -164,6 +170,14 @@ pub(crate) fn check_cache(
         return Err(candle_core::Error::Msg(format!(
             "cache has {} layers, model has {n_layer}",
             cache.n_layer()
+        )));
+    }
+    if let Some(i) = (0..n_layer).find(|&i| cache.kind(i) != Some(kind(i))) {
+        return Err(candle_core::Error::Msg(format!(
+            "cache layer {i} is {:?}, model needs {:?}; build the cache with \
+             CausalLM::new_cache",
+            cache.kind(i),
+            kind(i)
         )));
     }
     let past = cache.len();
@@ -174,6 +188,17 @@ pub(crate) fn check_cache(
         )));
     }
     Ok((past, total))
+}
+
+/// `lm_head` applied to the final position of `hidden` (`[batch, seq, hidden]`),
+/// giving `[batch, vocab]`.
+pub(crate) fn last_position_logits(hidden: &Tensor, lm_head: &Linear) -> Result<Tensor> {
+    match hidden.dim(1)? {
+        0 => Err(candle_core::Error::Msg(
+            "empty input: no position to take logits from".into(),
+        )),
+        seq => lm_head.forward(&hidden.i((.., seq - 1, ..))?),
+    }
 }
 
 #[cfg(test)]
@@ -233,17 +258,48 @@ mod tests {
         );
     }
 
+    const ATTN: fn(usize) -> LayerKind = |_| LayerKind::Attention;
+
     #[test]
     fn check_cache_rejects_a_layer_count_mismatch() {
         let cache = KvCache::new(4);
-        assert!(check_cache(&cache, 12, 1, 1024).is_err());
-        assert!(check_cache(&cache, 4, 1, 1024).is_ok());
+        assert!(check_cache(&cache, 12, ATTN, 1, 1024).is_err());
+        assert!(check_cache(&cache, 4, ATTN, 1, 1024).is_ok());
+    }
+
+    #[test]
+    fn check_cache_rejects_the_wrong_layer_layout() {
+        // An all-attention cache handed to a hybrid model errors rather than
+        // panicking in the first recurrent layer.
+        let cache = KvCache::new(4);
+        let hybrid = |i: usize| {
+            if i == 3 {
+                LayerKind::Attention
+            } else {
+                LayerKind::Recurrent
+            }
+        };
+        let err = check_cache(&cache, 4, hybrid, 1, 1024).unwrap_err();
+        assert!(err.to_string().contains("cache layer 0"), "{err}");
     }
 
     #[test]
     fn check_cache_rejects_overrunning_the_context_window() {
         let cache = KvCache::new(2);
-        assert!(check_cache(&cache, 2, 5, 4).is_err());
-        assert_eq!(check_cache(&cache, 2, 4, 4).unwrap(), (0, 4));
+        assert!(check_cache(&cache, 2, ATTN, 5, 4).is_err());
+        assert_eq!(check_cache(&cache, 2, ATTN, 4, 4).unwrap(), (0, 4));
+    }
+
+    #[test]
+    fn last_position_of_an_empty_input_is_an_error() {
+        let dev = Device::Cpu;
+        let head = Linear::new(
+            Tensor::zeros((5, 3), candle_core::DType::F32, &dev).unwrap(),
+            None,
+        );
+        let empty = Tensor::zeros((1, 0, 3), candle_core::DType::F32, &dev).unwrap();
+        assert!(last_position_logits(&empty, &head).is_err());
+        let one = Tensor::zeros((1, 2, 3), candle_core::DType::F32, &dev).unwrap();
+        assert_eq!(last_position_logits(&one, &head).unwrap().dims(), &[1, 5]);
     }
 }

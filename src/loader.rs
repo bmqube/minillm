@@ -14,8 +14,8 @@ use hf_hub::{split_id, HFClientSync};
 use tokenizers::Tokenizer;
 
 use crate::dtype::Precision;
-use crate::models::{gpt2::GPT2Config, qwen3::Qwen3Config};
-use crate::models::{CausalLM, GPT2Model, Qwen3Model};
+use crate::models::{gpt2::GPT2Config, qwen3::Qwen3Config, qwen3_5::Qwen35Config};
+use crate::models::{CausalLM, GPT2Model, Qwen35Model, Qwen3Model};
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -40,6 +40,7 @@ pub struct ModelFiles {
 pub enum Architecture {
     Gpt2,
     Qwen3,
+    Qwen35,
 }
 
 impl Architecture {
@@ -48,6 +49,7 @@ impl Architecture {
         match self {
             Self::Gpt2 => "gpt2",
             Self::Qwen3 => "qwen3",
+            Self::Qwen35 => "qwen3_5",
         }
     }
 }
@@ -69,6 +71,12 @@ struct ConfigProbe {
     /// the caller does not pin one.
     #[serde(default)]
     torch_dtype: Option<String>,
+    /// Newer Transformers name for `torch_dtype`.
+    #[serde(default)]
+    dtype: Option<String>,
+    /// Multimodal checkpoints (Qwen3.5) nest the language model's config here.
+    #[serde(default)]
+    text_config: Option<Box<ConfigProbe>>,
 }
 
 impl ConfigProbe {
@@ -77,24 +85,38 @@ impl ConfigProbe {
             match t {
                 "gpt2" => return Ok(Architecture::Gpt2),
                 "qwen3" => return Ok(Architecture::Qwen3),
+                "qwen3_5" | "qwen3_5_text" => return Ok(Architecture::Qwen35),
                 _ => {}
             }
         }
-        // Fall back to the class name for configs that omit `model_type`.
+        // Fall back to the class name for configs that omit `model_type`. Match
+        // whole class-name prefixes: "Qwen3" alone would also claim Qwen3.5
+        // ("Qwen3_5ForConditionalGeneration") and its MoE variant.
         for a in self.architectures.iter().flatten() {
             if a.starts_with("GPT2") {
                 return Ok(Architecture::Gpt2);
             }
-            if a.starts_with("Qwen3") {
+            if a.starts_with("Qwen3For") {
                 return Ok(Architecture::Qwen3);
+            }
+            if a.starts_with("Qwen3_5For") {
+                return Ok(Architecture::Qwen35);
             }
         }
         Err(format!(
             "unsupported checkpoint: model_type {:?}, architectures {:?}. \
-             This crate implements gpt2 and qwen3.",
+             This crate implements gpt2, qwen3 and qwen3_5 (dense).",
             self.model_type, self.architectures
         )
         .into())
+    }
+
+    /// The published dtype, wherever this config generation keeps it.
+    fn published_dtype(&self) -> Option<&str> {
+        self.torch_dtype
+            .as_deref()
+            .or(self.dtype.as_deref())
+            .or_else(|| self.text_config.as_ref()?.published_dtype())
     }
 }
 
@@ -247,8 +269,7 @@ pub fn load_files(
         Some(p) => p,
         None => {
             let inferred = probe
-                .torch_dtype
-                .as_deref()
+                .published_dtype()
                 .and_then(Precision::parse)
                 .unwrap_or_default();
             let resolved = inferred.resolve_for(device);
@@ -280,6 +301,10 @@ pub fn load_files(
         Architecture::Qwen3 => {
             let cfg: Qwen3Config = serde_json::from_str(&json)?;
             Box::new(Qwen3Model::new(&cfg, vb)?)
+        }
+        Architecture::Qwen35 => {
+            let cfg = Qwen35Config::from_json(&json)?;
+            Box::new(Qwen35Model::new(&cfg, vb)?)
         }
     };
     Ok((model, tokenizer))
@@ -319,6 +344,38 @@ mod tests {
         assert_eq!(p.architecture().unwrap(), Architecture::Qwen3);
         let p = probe_json(r#"{"architectures": ["GPT2LMHeadModel"]}"#);
         assert_eq!(p.architecture().unwrap(), Architecture::Gpt2);
+    }
+
+    #[test]
+    fn detects_qwen3_5_and_reads_the_nested_dtype() {
+        let p = probe_json(
+            r#"{"model_type": "qwen3_5",
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "text_config": {"model_type": "qwen3_5_text", "dtype": "bfloat16"}}"#,
+        );
+        assert_eq!(p.architecture().unwrap(), Architecture::Qwen35);
+        assert_eq!(
+            p.published_dtype().and_then(Precision::parse),
+            Some(Precision::BF16)
+        );
+    }
+
+    #[test]
+    fn qwen3_5_class_names_are_not_claimed_by_qwen3() {
+        // Without model_type, the class-name fallback decides. A bare "Qwen3"
+        // prefix match would load a hybrid checkpoint as plain Qwen3.
+        let p = probe_json(r#"{"architectures": ["Qwen3_5ForConditionalGeneration"]}"#);
+        assert_eq!(p.architecture().unwrap(), Architecture::Qwen35);
+    }
+
+    #[test]
+    fn rejects_the_qwen3_5_moe_variant() {
+        for json in [
+            r#"{"model_type": "qwen3_5_moe"}"#,
+            r#"{"architectures": ["Qwen3_5MoeForConditionalGeneration"]}"#,
+        ] {
+            assert!(probe_json(json).architecture().is_err(), "{json}");
+        }
     }
 
     #[test]

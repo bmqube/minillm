@@ -2,8 +2,9 @@
 name = "minillm"
 version = "0.3.0"
 edition = "2021"
-# hf-hub's xet transfer stack (redb, konst) needs 1.89.
-rust-version = "1.89"
+# hf-hub's xet transfer stack needs 1.91 (xet-core-structures uses
+# `str::floor_char_boundary`); CI checks this version.
+rust-version = "1.91"
 # `cargo run` with no `--bin` runs the CLI demo, as the README shows.
 default-run = "minillm"
 authors = ["BM Monjur Morshed"]

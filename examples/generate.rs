@@ -4,7 +4,7 @@
 //! cargo run --release --example generate -- "Your prompt here"
 //! ```
 
-use minillm::generation::{Generator, SamplingConfig, TextStream};
+use minillm::generation::{Generator, SamplingConfig};
 use minillm::{device, loader};
 use std::io::Write;
 
@@ -32,16 +32,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     print!("{prompt}");
     // Each step feeds the token it returns, so stop while that still fits.
     let steps = 40.min(model.meta().n_ctx.saturating_sub(ids.len()));
-    // Decodes the completion so far, so a character split across tokens
-    // prints whole.
-    let mut text = TextStream::new(&tokenizer);
+    // Holds back a character split across tokens until it is whole.
+    let mut text = tokenizer.decode_stream(false);
     for _ in 0..steps {
         let next = generator.next_token(&cfg)?;
         if next == eot {
             break;
         }
-        print!("{}", text.push(next)?);
-        std::io::stdout().flush()?;
+        if let Some(piece) = text.step(next)? {
+            print!("{piece}");
+            std::io::stdout().flush()?;
+        }
     }
     println!();
     Ok(())

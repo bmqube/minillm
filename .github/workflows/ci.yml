@@ -44,3 +44,19 @@ jobs:
 
       - name: Docs
         run: cargo doc --no-deps
+
+  msrv:
+    name: build on the declared rust-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep in step with `rust-version` in Cargo.toml.
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --locked --all-targets

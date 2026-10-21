@@ -12,10 +12,14 @@
 //! Each case skips with a message rather than failing if its checkpoint is
 //! absent, so running with any subset present is fine.
 //!
+//! Weights load at the checkpoint's own precision; set `MINILLM_PRECISION` to
+//! `f32`, `f16` or `bf16` to pin it (the GPU runbook's gate runs at f32).
+//!
 //! For Qwen3.5 the "no cache" reference recomputes every step from a fresh
 //! state, so `cache_matches_no_cache` checks that a recurrent state carried
 //! across steps lands exactly where recomputing it from scratch does.
 
+use minillm::dtype::Precision;
 use minillm::generation::{greedy, greedy_no_cache, Generator};
 use minillm::kv_cache::{KvQuant, LayerKind};
 use minillm::models::CausalLM;
@@ -33,7 +37,13 @@ fn load(dir: &str) -> Option<(Box<dyn CausalLM>, tokenizers::Tokenizer)> {
         eprintln!("skipping: {dir} not present");
         return None;
     }
-    Some(loader::load(dir, &device::best()).unwrap_or_else(|e| panic!("load {dir}: {e}")))
+    let precision = std::env::var("MINILLM_PRECISION").ok().map(|s| {
+        Precision::parse(&s).unwrap_or_else(|| panic!("MINILLM_PRECISION={s:?}: want f32|f16|bf16"))
+    });
+    Some(
+        loader::load_with(dir, &device::best(), precision)
+            .unwrap_or_else(|e| panic!("load {dir}: {e}")),
+    )
 }
 
 /// Greedy decoding with a KV cache must produce the exact same token ids as

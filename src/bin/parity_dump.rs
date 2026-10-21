@@ -2,7 +2,8 @@
 //! compared against a reference implementation. Pairs with `benchmarks/parity.py`.
 //!
 //! ```text
-//! cargo run --release --bin parity_dump -- [--cache] [PROMPTS_FILE] [OUT_JSON] [MODEL]
+//! cargo run --release --bin parity_dump -- [--cache] [--precision f32|f16|bf16] \
+//!     [PROMPTS_FILE] [OUT_JSON] [MODEL]
 //! ```
 //!
 //! Defaults: `benchmarks/prompts.txt benchmarks/minillm_logits.json benchmarks/gpt2`.
@@ -16,6 +17,10 @@
 //! offset causal mask and the single-token decode path still match the
 //! reference. Without it, the plain full-sequence `forward` is used.
 //!
+//! `--precision` pins the weight dtype; the default is the checkpoint's own.
+//! `parity.py` compares against an fp32 reference, so its thresholds hold at
+//! `--precision f32` (bf16 checkpoints load at bf16 on a GPU otherwise).
+//!
 //! Output JSON: `{ "model": <ref>, "entries": [ { "prompt", "input_ids", "logits" } ] }`
 //! where `logits` is the raw (pre-softmax) vector for the position after the
 //! last prompt token, and `<ref>` is what `parity.py` should load as the
@@ -25,6 +30,7 @@ use std::io::Write;
 use std::path::Path;
 
 use candle_core::{IndexOp, Tensor};
+use minillm::dtype::Precision;
 use minillm::generation::Generator;
 use minillm::models::CausalLM;
 use minillm::{loader, ExecutionPlan};
@@ -48,9 +54,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut positional: Vec<String> = Vec::new();
     let mut use_cache = false;
-    for arg in std::env::args().skip(1) {
+    let mut precision: Option<Precision> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cache" => use_cache = true,
+            "--precision" => {
+                let v = args.next().unwrap_or_default();
+                precision = Some(
+                    Precision::parse(&v)
+                        .ok_or_else(|| format!("--precision expects f32|f16|bf16, got {v:?}"))?,
+                );
+            }
             _ => positional.push(arg),
         }
     }
@@ -83,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "model: {model}  ref: {model_ref}  path: {}",
         if use_cache { "KV cache" } else { "forward" }
     );
-    let (net, tokenizer) = loader::load(&model, &dev)?;
+    let (net, tokenizer) = loader::load_with(&model, &dev, precision)?;
     let net = net.as_ref();
     eprintln!(
         "arch: {}  precision: {}",

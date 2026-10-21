@@ -10,7 +10,7 @@
 //!
 //! Per layer, `k` and `v` are `[batch, n_kv_head, seq, head_dim]` — the shape the
 //! attention code has right after `qkv ... transpose(1, 2)`. The cache grows
-//! along `dim = 2` (the sequence axis) via [`Tensor::cat`].
+//! along `dim = 2` (the sequence axis).
 //!
 //! Under grouped-query attention `n_kv_head < n_head`, and it is the **narrow**
 //! `n_kv_head` tensor that is cached; expanding to one key/value per query head
@@ -20,24 +20,30 @@
 //!
 //! # Cost — and what this implementation does *not* do
 //!
-//! Two deliberate simplifications shape every number in `benchmarks/`:
+//! **Full-precision storage is preallocated.** K and V live in a buffer with
+//! spare capacity along the sequence axis; `append` writes the new positions in
+//! place ([`Tensor::slice_set`]) and returns a narrowed view of the filled part,
+//! which both the CPU gemm and cuBLAS consume without a copy. When the buffer is
+//! full it is replaced by one twice the size, so the total copying over a decode
+//! is O(n) rather than the O(n²) bytes a per-step [`Tensor::cat`] moves. The
+//! cost is up to 2x the *allocated* footprint over the retained one;
+//! [`KvQuant::bytes_per_token`] counts what is retained.
 //!
-//! 1. **`append` grows the cache with [`Tensor::cat`]**, which copies the whole
-//!    cache on every decode step. The step is still O(n) overall (the attention
-//!    matmul is O(n·head_dim) anyway), but the copy is a large constant, and
-//!    total decode work is O(n²) in *bytes moved*. A capacity-doubling
-//!    preallocated buffer written in place would remove it.
-//! 2. **Quantized modes dequantize the entire cache on every step**, so the
-//!    attention matmul stays at the model precision. That adds a second O(n)
-//!    pass per step on top of the copy.
+//! Two simplifications remain in the quantized modes, and shape their numbers
+//! in `benchmarks/`:
 //!
-//! Together these are why cached decode throughput still falls with context
-//! length, and why the quantized paths fall *faster* than fp32 (int4 more than
-//! int8 — nibble unpacking is heavier than a byte cast). They also mean
-//! quantization shrinks the **retained** footprint but not the transient one, so
-//! peak RSS does not move. Turning the memory saving into a speed and peak-RSS
-//! win requires a low-precision matmul or chunked dequantization, not a change
-//! to this container.
+//! 1. **They still grow with [`Tensor::cat`]**, copying the whole (narrow) cache
+//!    on every decode step.
+//! 2. **They dequantize the entire cache on every step**, so the attention
+//!    matmul stays at the model precision. That adds a second O(n) pass per
+//!    step on top of the copy.
+//!
+//! Together these are why the quantized paths lose throughput with context
+//! length faster than full precision does (int4 more than int8 — nibble
+//! unpacking is heavier than a byte cast). They also mean quantization shrinks
+//! the **retained** footprint but not the transient one, so peak RSS does not
+//! move. Turning the memory saving into a speed and peak-RSS win requires a
+//! low-precision matmul or chunked dequantization.
 //!
 //! # Quantized storage
 //!
@@ -160,8 +166,9 @@ impl std::fmt::Display for KvQuant {
 /// silently promoting the whole cache to fp32.
 #[derive(Debug)]
 enum Slot {
-    /// Stored at the model precision, whatever that is.
-    Full(Tensor),
+    /// Stored at the model precision, whatever that is. `buf` has room for at
+    /// least `len` positions along [`SEQ_DIM`]; only the first `len` are valid.
+    Full { buf: Tensor, len: usize },
     /// `q`: `u8` `[b, n_kv_head, seq, head_dim]` (int8 biased by +128).
     /// `scale`: `f32` `[b, n_kv_head, seq, 1]`.
     Q8 {
@@ -182,7 +189,7 @@ enum Slot {
 impl Slot {
     fn seq_len(&self) -> usize {
         let t = match self {
-            Slot::Full(t) => t,
+            Slot::Full { len, .. } => return *len,
             Slot::Q8 { q, .. } => q,
             Slot::Q4 { q, .. } => q,
         };
@@ -192,7 +199,7 @@ impl Slot {
     /// Full-precision view of what is stored, in the dtype it was appended at.
     fn dequantized(&self) -> Result<Tensor> {
         match self {
-            Slot::Full(t) => Ok(t.clone()),
+            Slot::Full { buf, len } => buf.narrow(SEQ_DIM, 0, *len),
             Slot::Q8 { q, scale, dtype } => dequantize_i8(q, scale, *dtype),
             Slot::Q4 {
                 q,
@@ -269,9 +276,11 @@ impl LayerKvCache {
     /// `(keys, values)` to attend the new queries over.
     ///
     /// On the first call the inputs seed the cache; afterwards they are
-    /// concatenated along the sequence axis. With a quantized mode the stored
-    /// copy is narrow; the returned tensors are always at the appended dtype and
-    /// contiguous.
+    /// appended along the sequence axis. The returned tensors are always at the
+    /// appended dtype. At full precision they are views into the cache buffer —
+    /// strided along the sequence axis, so call `.contiguous()` before an op that
+    /// needs it; matmul does not. With a quantized mode the stored copy is
+    /// narrow and the returned tensors are freshly dequantized and contiguous.
     pub fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<(Tensor, Tensor)> {
         let quant = self.quant;
         let k = push(&mut self.k, quant, k_new)?;
@@ -286,13 +295,20 @@ fn push(slot: &mut Option<Slot>, quant: KvQuant, new: &Tensor) -> Result<Tensor>
     let dtype = new.dtype();
     match quant {
         KvQuant::None => {
-            let full = match slot.take() {
-                None => new,
-                Some(Slot::Full(prev)) => Tensor::cat(&[&prev, &new], SEQ_DIM)?.contiguous()?,
+            let (buf, len) = match slot.take() {
+                None => (None, 0),
+                Some(Slot::Full { buf, len }) => (Some(buf), len),
                 Some(_) => return Err(mode_switch_err()),
             };
-            *slot = Some(Slot::Full(full.clone()));
-            Ok(full)
+            let needed = len + new.dim(SEQ_DIM)?;
+            let buf = match buf {
+                Some(buf) if buf.dim(SEQ_DIM)? >= needed => buf,
+                old => grow(old.as_ref(), len, needed, &new)?,
+            };
+            buf.slice_set(&new, SEQ_DIM, len)?;
+            let view = buf.narrow(SEQ_DIM, 0, needed)?;
+            *slot = Some(Slot::Full { buf, len: needed });
+            Ok(view)
         }
         KvQuant::Int8 => {
             let (q_new, s_new) = quantize_i8_per_token(&new)?;
@@ -329,6 +345,22 @@ fn push(slot: &mut Option<Slot>, quant: KvQuant, new: &Tensor) -> Result<Tensor>
             Ok(full)
         }
     }
+}
+
+/// Smallest buffer a full-precision slot allocates, in positions.
+const MIN_CAPACITY: usize = 64;
+
+/// A zeroed buffer shaped like `like` with room for at least `needed` positions
+/// (rounded up to a power of two, so repeated growth doubles), holding a copy of
+/// the first `len` positions of `old`.
+fn grow(old: Option<&Tensor>, len: usize, needed: usize, like: &Tensor) -> Result<Tensor> {
+    let mut dims = like.dims().to_vec();
+    dims[SEQ_DIM] = needed.max(MIN_CAPACITY).next_power_of_two();
+    let buf = Tensor::zeros(dims, like.dtype(), like.device())?;
+    if let Some(old) = old.filter(|_| len > 0) {
+        buf.slice_set(&old.narrow(SEQ_DIM, 0, len)?.contiguous()?, SEQ_DIM, 0)?;
+    }
+    Ok(buf)
 }
 
 fn mode_switch_err() -> candle_core::Error {
@@ -546,6 +578,56 @@ mod tests {
         assert_eq!(rows[0], vec![7.0; 4]);
         assert_eq!(rows[1], vec![7.0; 4]);
         assert_eq!(rows[2], vec![9.0; 4]);
+    }
+
+    #[test]
+    fn growth_past_capacity_matches_concatenation() {
+        // Prefill 60, then one position at a time past the 64-slot first buffer
+        // and the 128-slot second one; every returned view must equal what a
+        // plain concatenation of the same inputs gives.
+        let mut c = LayerKvCache::new();
+        let mut reference = kv_ramp(60);
+        c.append(&reference, &reference).unwrap();
+        for t in 0..80 {
+            let step = (kv_ramp(1) + t as f64).unwrap();
+            let (k, v) = c.append(&step, &step).unwrap();
+            reference = Tensor::cat(&[&reference, &step], SEQ_DIM).unwrap();
+            assert_eq!(k.dims(), reference.dims());
+            assert_eq!(max_abs_diff(&k, &reference), 0.0, "keys after step {t}");
+            assert_eq!(max_abs_diff(&v, &reference), 0.0, "values after step {t}");
+        }
+        assert_eq!(c.len(), 140);
+    }
+
+    #[test]
+    fn capacity_doubles_rather_than_growing_per_step() {
+        let mut c = LayerKvCache::new();
+        let capacity = |c: &LayerKvCache| match c.k.as_ref().unwrap() {
+            Slot::Full { buf, .. } => buf.dim(SEQ_DIM).unwrap(),
+            _ => unreachable!(),
+        };
+        c.append(&kv(1, 0.0), &kv(1, 0.0)).unwrap();
+        assert_eq!(capacity(&c), MIN_CAPACITY);
+        for _ in 1..MIN_CAPACITY {
+            c.append(&kv(1, 0.0), &kv(1, 0.0)).unwrap();
+        }
+        assert_eq!(capacity(&c), MIN_CAPACITY, "exactly full, not yet grown");
+        c.append(&kv(1, 0.0), &kv(1, 0.0)).unwrap();
+        assert_eq!(capacity(&c), 2 * MIN_CAPACITY);
+        // A bulk append larger than double jumps straight to a big enough size.
+        c.append(&kv(300, 0.0), &kv(300, 0.0)).unwrap();
+        assert_eq!(capacity(&c), 512);
+    }
+
+    #[test]
+    fn earlier_views_survive_later_appends() {
+        // A view handed out before a grow keeps the old buffer alive and
+        // unchanged.
+        let mut c = LayerKvCache::new();
+        let (k_before, _) = c.append(&kv_ramp(64), &kv_ramp(64)).unwrap();
+        let snapshot = k_before.contiguous().unwrap();
+        c.append(&kv(10, 99.0), &kv(10, 99.0)).unwrap();
+        assert_eq!(max_abs_diff(&k_before, &snapshot), 0.0);
     }
 
     #[test]

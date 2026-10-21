@@ -3,7 +3,7 @@ use candle_nn::{Linear, RmsNorm, VarBuilder};
 
 use super::config::Qwen3Config;
 use crate::kv_cache::LayerKvCache;
-use crate::layers::{repeat_kv, RotaryEmbedding};
+use crate::layers::{grouped_attention, RotaryEmbedding};
 
 /// Qwen3 attention: grouped-query, rotary, with per-head RMS normalization of Q
 /// and K before the rotation.
@@ -127,29 +127,13 @@ impl Qwen3Attention {
     /// Scaled dot-product attention over cached K/V.
     ///
     /// `q` is `[batch, n_head, q_len, head_dim]`; `k`/`v` are
-    /// `[batch, n_kv_head, kv_len, head_dim]` and are expanded to the query head
-    /// count here, per step, never in the cache. The optional additive `mask` is
-    /// `[q_len, kv_len]` and must already be in the activation dtype.
+    /// `[batch, n_kv_head, kv_len, head_dim]`, possibly strided views into the
+    /// cache buffer, and are never expanded to the query head count — see
+    /// [`grouped_attention`]. The optional additive `mask` is `[q_len, kv_len]`
+    /// and must already be in the activation dtype.
     fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let (batch, _, q_len, head_dim) = q.dims4()?;
-        let scale = 1.0 / (head_dim as f64).sqrt();
-
-        let k = repeat_kv(k, self.n_kv_groups)?;
-        let v = repeat_kv(v, self.n_kv_groups)?;
-
-        // `.transpose()` alone is a free stride-swap — candle's matmul takes the
-        // strided layout directly, and `repeat_kv` already returned a contiguous
-        // tensor. A `.contiguous()` here would copy the whole expanded K every
-        // decode step, which is the copy `attend` exists to avoid.
-        let scores = q.matmul(&k.transpose(2, 3)?)?;
-        let mut scores = (scores * scale)?;
-
-        if let Some(mask) = mask {
-            scores = scores.broadcast_add(mask)?;
-        }
-
-        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = weights.matmul(&v)?;
+        let (batch, _, q_len, _) = q.dims4()?;
+        let out = grouped_attention(q, k, v, mask, self.n_kv_groups)?;
 
         // [b, n_head, q, head_dim] -> [b, q, n_head * head_dim]. The width is
         // `q_out`, not `hidden_size`; see the field's doc comment.

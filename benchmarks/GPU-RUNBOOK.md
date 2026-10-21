@@ -113,7 +113,15 @@ Weights only; add the KV cache and activations on top. bf16 unless noted.
 | Qwen3-4B | 4 B | ~8 GB | yes |
 | **Qwen3-8B** | 8 B | ~16 GB | **yes — the headline config** |
 | Qwen3-14B | 14 B | ~28 GB | tight; short context only |
+| Qwen3.5-0.8B | 0.75 B text | ~1.5 GB | yes, trivially |
+| **Qwen3.5-9B** | ~9 B text | ≤ 19 GB | **yes**, with a KV cache in only 8 of its 32 layers |
+| Qwen3.5 / 3.6 / 3.8-27B | 27.8 B | ~56 GB | no — needs weight quantization |
 | GPT-2 xl | 1.5 B | ~6 GB at fp32 | yes |
+
+Qwen3.5 checkpoints are multimodal; only the text model loads, and the sizes
+above are for it. Fetch `config.json`, `tokenizer.json`, `tokenizer_config.json`,
+`model.safetensors.index.json` and every shard it names (see
+`benchmarks/README.md` §0).
 
 KV cache per 1000 tokens, for reference: Qwen3-8B is 36 layers x 8 KV heads x
 128 dim x 2 (K+V) x 2 B = **147 MB/1k tokens** at bf16. A 32k-token context is
@@ -182,7 +190,8 @@ Pass criteria: `mean cos > 0.9999`, `top1 = 24/24`, `mean mse < 1e-3`.
 cargo test --release --features cuda --test cache_parity -- --ignored --nocapture
 ```
 
-All 8 must pass. `cache_matches_no_cache` is the important one: greedy decode
+All 13 must pass (each architecture's cases skip if its weights are absent).
+`cache_matches_no_cache` is the important one: greedy decode
 with the cache must produce byte-identical token ids to full recompute.
 
 ### 4.3 Throughput sweep
@@ -213,10 +222,30 @@ than a loaded CPU, but the first iteration still pays for lazy kernel selection;
 the harness does one untimed warm-up per config.
 
 **Push the context length.** The CPU tables stop at 512 tokens because that is
-where CPU decode becomes unusable. On a 5090, Qwen3 can run to 8k–32k, and that
+where CPU decode becomes unusable. On a 5090, Qwen3 can run to ~8k, and that
 is where the KV cache stops being a rounding error against the weights and the
 quantization ablation acquires a point. Long-context rows are the ones worth
-having.
+having. The ceiling is prefill, not the cache: without a FlashAttention path the
+prompt's full attention-score matrix is materialised, ~2 GB at 8k for
+Qwen3-0.6B and ~34 GB at 32k.
+
+**Qwen3 against Qwen3.5 at long context.** On the CPU, Qwen3.5-0.8B lost 8% of
+its decode rate from 64 to 960 tokens and Qwen3-0.6B lost 27%, and the two were
+within 4% at 960 (`benchmarks/README.md` §10). Where they cross is a GPU
+question:
+
+```bash
+./target/release/sweep benchmarks/qwen3-0.6b,benchmarks/qwen3.5-0.8b \
+  512,2048,8192 32 on none --repeats 5 --precision bf16 > benchmarks/sweep_gpu_hybrid.csv
+```
+
+Stop at 8k. Prefill materialises the full attention-score matrix (there is no
+FlashAttention path): for Qwen3-0.6B at 32k tokens that is 16 heads × 32768² ×
+2 B ≈ 34 GB, more than the card has. 8k is ~2 GB.
+
+Expect Qwen3.5 prefill to be the slow column: its DeltaNet layers prefill token
+by token, and on a GPU that is thousands of tiny kernel launches per layer. Time
+the long rows with that in mind, and treat prefill and decode separately.
 
 ### 4.4 Perplexity / quality
 

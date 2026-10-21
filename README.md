@@ -7,22 +7,23 @@ checkpoints from the HuggingFace Hub and runs autoregressive text generation on
 CPU or CUDA, with a KV cache that can store keys and values at full precision,
 per-token int8, or per-token packed int4.
 
-Two architectures, one interface:
+Three architectures, one interface:
 
-| | GPT-2 | Qwen3 |
-|---|---|---|
-| checkpoints | `openai-community/gpt2{,-medium,-large,-xl}` | `Qwen/Qwen3-{0.6B,1.7B,4B,8B,14B}` |
-| positions | learned `wpe` table | RoPE (`rope_theta` 1e6) |
-| normalization | LayerNorm | RMSNorm |
-| attention | multi-head, fused QKV | grouped-query, separate Q/K/V |
-| Q/K scaling | — | per-head RMSNorm (QK-norm) before RoPE |
-| MLP | 4×, tanh-GELU | SwiGLU |
-| weight layout | Conv1D `[in, out]` | `nn.Linear` `[out, in]` |
-| context | 1024 | 40960 |
-| published dtype | fp32 | bf16 |
+| | GPT-2 | Qwen3 | Qwen3.5 |
+|---|---|---|---|
+| checkpoints | `openai-community/gpt2{,-medium,-large,-xl}` | `Qwen/Qwen3-{0.6B,1.7B,4B,8B,14B}` | `Qwen/Qwen3.5-{0.8B,2B,4B,9B,27B}`, `Qwen3.6-27B`, `Qwen3.8-27B` |
+| token mixer | multi-head attention | grouped-query attention | **hybrid**: Gated DeltaNet ×3, gated GQA ×1 |
+| decode state | KV cache | KV cache | KV cache in 1 layer of 4, fixed-size recurrent state in the rest |
+| positions | learned `wpe` table | RoPE (`rope_theta` 1e6) | RoPE on 25% of each head (`rope_theta` 1e7) |
+| normalization | LayerNorm | RMSNorm | RMSNorm, zero-centred gain `x̂·(1+w)` |
+| Q/K scaling | — | per-head RMSNorm (QK-norm) before RoPE | QK-norm; L2-norm in DeltaNet |
+| MLP | 4×, tanh-GELU | SwiGLU | SwiGLU |
+| weight layout | Conv1D `[in, out]` | `nn.Linear` `[out, in]` | `nn.Linear`, under `model.language_model.` |
+| context | 1024 | 40960 | 262144 |
+| published dtype | fp32 | bf16 | bf16 |
 
-Both are verified against HuggingFace Transformers to floating-point noise, on
-the forward path *and* the KV-cache path (see [Benchmarks](#benchmarks)).
+All three are verified against HuggingFace Transformers to floating-point noise,
+on the forward path *and* the KV-cache path (see [Benchmarks](#benchmarks)).
 
 ## Two implementations
 
@@ -36,7 +37,7 @@ If you want to see the transformer built without a tensor framework, read the
 
 ## Status and scope
 
-- **Works:** GPT-2 and Qwen3 weight loading (single-file *and* sharded
+- **Works:** GPT-2, Qwen3 and Qwen3.5 (dense) weight loading (single-file *and* sharded
   safetensors), forward pass, greedy / temperature / top-k / top-p sampling,
   CPU and CUDA execution.
 - **No weight quantization.** Weights load at the checkpoint's own
@@ -68,10 +69,19 @@ If you want to see the transformer built without a tensor framework, read the
   costs effectively nothing (Δppl ≈ +0.008 on WikiText-2) — **but that result
   does not transfer to Qwen3**, which is ~7× more sensitive to int8 and ~15×
   more to int4, to the point where int8 changes the top-1 token on prompts GPT-2
-  handles unaffected. See [Benchmarks](#benchmarks).
-- Larger sizes (`gpt2-medium/large/xl`, `Qwen3-1.7B` and up) share their
-  family's architecture and load through the same path, but only `gpt2` 124M and
-  `Qwen3-0.6B` are regularly exercised.
+  handles unaffected. Qwen3.5, which rotates only a quarter of each head and
+  caches K/V in only 6 of its 24 layers, sits far closer to GPT-2 (int8 drift
+  0.054σ against Qwen3's 0.266σ, on one prompt). See [Benchmarks](#benchmarks).
+- **Hybrid linear attention (Qwen3.5).** Three of every four layers are Gated
+  DeltaNet, whose decode state is a fixed-size matrix per head, so the cache
+  holds per-layer *state*, either a growing KV cache or a constant recurrent
+  one. On Qwen3.5-0.8B the KV cache is 9.3× smaller per token than
+  Qwen3-0.6B's, and cached decode loses 8% of its speed from 64 to 960 tokens of
+  context against Qwen3's 27%. The vision tower and MTP head ship in the
+  checkpoint but are not loaded; the MoE variants (`35B-A3B`) are rejected.
+- Larger sizes (`gpt2-medium/large/xl`, `Qwen3-1.7B` and up, `Qwen3.5-2B` and
+  up) share their family's architecture and load through the same path, but only
+  `gpt2` 124M, `Qwen3-0.6B` and `Qwen3.5-0.8B` are regularly exercised.
 - Inference only — no training.
 
 ## Architecture
@@ -101,7 +111,9 @@ src/
 └── models/
     ├── mod.rs      CausalLM trait + ModelMeta (layers, q/kv heads, head_dim, ctx, params)
     ├── gpt2/       config, attention (fused QKV, MHA), block (pre-LN + GELU MLP), model
-    └── qwen3/      config, attention (GQA + QK-norm + RoPE), block (RMSNorm + SwiGLU), model
+    ├── qwen3/      config, attention (GQA + QK-norm + RoPE), block (RMSNorm + SwiGLU), model
+    └── qwen3_5/    config, delta_net (Gated DeltaNet), attention (gated GQA, partial RoPE),
+                    norm (zero-centred + gated RMSNorm), block, model
 
 src/bin/
 ├── bench.rs        throughput + size benchmark, no-cache vs KV-cache decode
@@ -337,12 +349,16 @@ KV-cache-byte counts, and the `KvCache` container (append grows the sequence
 axis, `reset`, length tracking, int8/int4 round-trip error bounds). These do not
 require downloading a model.
 
-The end-to-end KV-cache checks need GPT-2 weights in `benchmarks/gpt2/` and are
-`#[ignore]`d by default:
+The end-to-end KV-cache checks need weights in `benchmarks/gpt2/`,
+`benchmarks/qwen3-0.6b/` and/or `benchmarks/qwen3.5-0.8b/` (each architecture's
+cases skip if its directory is absent) and are `#[ignore]`d by default:
 
 ```bash
-cargo test --test cache_parity -- --ignored
+cargo test --release --test cache_parity -- --ignored --test-threads=1
 ```
+
+`--test-threads=1` keeps one model in memory at a time; run in parallel, the
+fp32 Qwen copies need well over 13 GiB.
 
 `cache_matches_no_cache` asserts that greedy decoding with the cache produces the
 exact same token ids as the full-recompute `forward`; `quantized_caches_stay_close_to_fp32`
@@ -370,7 +386,12 @@ push and PR.
 - **CPU mixed precision** — f16 weight storage with fp32 activations for bf16
   checkpoints: half the memory and bandwidth of the current fp32 fallback
 - Low-precision attention matmul (turn the memory saving into a peak-RSS + speed win)
-- Verify and benchmark `gpt2-medium/large/xl`, `Qwen3-1.7B/4B/8B`
+- ~~A hybrid architecture~~ — done (Qwen3.5: Gated DeltaNet, per-layer recurrent state)
+- **Chunked DeltaNet prefill** — prefill runs the recurrence token by token,
+  25–40% slower than Qwen3's attention prefill on CPU
+- **MTP speculative decoding** — Qwen3.5 checkpoints carry a multi-token-
+  prediction head, a ready-made drafter
+- Verify and benchmark `gpt2-medium/large/xl`, `Qwen3-1.7B/4B/8B`, `Qwen3.5-2B/4B/9B`
 - Batched generation
 
 ## License

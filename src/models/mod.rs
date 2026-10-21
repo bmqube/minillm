@@ -29,8 +29,12 @@ pub use qwen3::Qwen3Model;
 pub struct ModelMeta {
     /// Short architecture name, e.g. `"gpt2"` or `"qwen3"`.
     pub architecture: &'static str,
-    /// Number of transformer blocks — also the number of KV-cache layers.
+    /// Number of transformer blocks.
     pub n_layer: usize,
+    /// Blocks that keep a KV cache. Equals `n_layer` for an all-attention model;
+    /// smaller for a hybrid one, whose linear-attention blocks keep a fixed-size
+    /// recurrent state instead (6 of 24 on Qwen3.5-0.8B).
+    pub n_kv_layers: usize,
     /// Query heads per block.
     pub n_head: usize,
     /// Key/value heads per block. Equals `n_head` for multi-head attention;
@@ -58,11 +62,11 @@ impl ModelMeta {
 
     /// Bytes of KV cache retained per sequence position at `bytes_per_elem`.
     ///
-    /// `2` for K and V, times the layer count, times the *key/value* head count
-    /// times the head width. Under GQA this is `n_kv_groups()` times smaller than
-    /// the naive `n_head`-based figure.
+    /// `2` for K and V, times the number of layers that keep a KV cache, times
+    /// the *key/value* head count times the head width. Under GQA this is
+    /// `n_kv_groups()` times smaller than the naive `n_head`-based figure.
     pub fn kv_cache_bytes_per_token(&self, bytes_per_elem: usize) -> usize {
-        2 * self.n_layer * self.n_kv_head * self.head_dim * bytes_per_elem
+        2 * self.n_kv_layers * self.n_kv_head * self.head_dim * bytes_per_elem
     }
 
     /// [`kv_cache_bytes_per_token`](Self::kv_cache_bytes_per_token) for a
@@ -77,7 +81,7 @@ impl ModelMeta {
     /// fixed-width values plus fp32 scales either way.
     pub fn kv_cache_bytes_per_token_with(&self, quant: KvQuant, precision: Precision) -> usize {
         quant.bytes_per_token(
-            self.n_layer,
+            self.n_kv_layers,
             self.n_kv_head,
             self.head_dim,
             precision.size_in_bytes(),
@@ -134,7 +138,14 @@ pub trait CausalLM: Send + Sync {
 
     /// A cache sized for this model, storing K/V at the model's own precision.
     fn new_cache(&self) -> KvCache {
-        KvCache::new(self.meta().n_layer)
+        self.new_cache_with(KvQuant::None)
+    }
+
+    /// A cache sized for this model whose attention layers store K/V with
+    /// `quant`. All-attention by default; a hybrid model overrides this with
+    /// its own layer layout.
+    fn new_cache_with(&self, quant: KvQuant) -> KvCache {
+        KvCache::with_quant(self.meta().n_layer, quant)
     }
 }
 
@@ -170,6 +181,7 @@ mod tests {
         ModelMeta {
             architecture: "test",
             n_layer,
+            n_kv_layers: n_layer,
             n_head,
             n_kv_head,
             head_dim,

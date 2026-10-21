@@ -256,7 +256,7 @@ impl<'m> Generator<'m> {
     pub fn with_quant(model: &'m dyn CausalLM, quant: KvQuant) -> Self {
         Self {
             device: model.device().clone(),
-            cache: KvCache::with_quant(model.meta().n_layer, quant),
+            cache: model.new_cache_with(quant),
             model,
             logits: None,
         }

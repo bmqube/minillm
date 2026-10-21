@@ -115,6 +115,7 @@ impl GPT2Config {
         ModelMeta {
             architecture: "gpt2",
             n_layer: self.n_layer,
+            n_kv_layers: self.n_layer,
             n_head: self.n_head,
             // GPT-2 predates grouped-query attention: one KV head per query head.
             n_kv_head: self.n_head,

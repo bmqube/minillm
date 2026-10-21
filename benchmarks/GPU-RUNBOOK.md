@@ -14,7 +14,7 @@ CUDA GPU works, the only thing that changes is which models fit.
 |---|---|
 | NVIDIA driver | 570+ for Blackwell (`nvidia-smi` should print the card) |
 | CUDA toolkit | 12.8 or newer for `sm_120`; **12.0–12.6 will not compile for a 5090** |
-| Rust | 1.87+ |
+| Rust | 1.89+ |
 | C toolchain | Linux: system gcc. Windows: MSVC build tools, or MSYS2 mingw-w64 (see the root README) |
 
 Check the toolkit is visible:

@@ -24,7 +24,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use minillm::generation::{Generator, SamplingConfig};
+//! use minillm::generation::{Generator, SamplingConfig, TextStream};
 //! use minillm::{device, loader};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -35,10 +35,10 @@
 //! let cfg = SamplingConfig { temperature: 0.8, top_k: Some(40), top_p: Some(0.95) };
 //!
 //! let mut generator = Generator::new(model.as_ref());
+//! let mut text = TextStream::new(&tokenizer);
 //! generator.prefill(&ids)?;
 //! for _ in 0..40 {
-//!     let next = generator.next_token(&cfg)?;
-//!     print!("{}", tokenizer.decode(&[next], false)?);
+//!     print!("{}", text.push(generator.next_token(&cfg)?)?);
 //! }
 //! # Ok(())
 //! # }

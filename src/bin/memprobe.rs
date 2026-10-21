@@ -30,6 +30,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let kv_quant = KvQuant::parse(&kvq_arg)
         .unwrap_or_else(|| panic!("KVQUANT expects none|int8|int4, got {kvq_arg:?}"));
 
+    // Fail before the run, not after it.
+    peak_rss_bytes()
+        .ok_or("peak RSS is only read on Linux and Windows; elsewhere use /usr/bin/time")?;
+
     let plan = ExecutionPlan::detect();
     plan.log();
     let dev = plan.device().clone();
@@ -47,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         other => return Err(format!("mode must be 'off' or 'on', got {other:?}").into()),
     }
 
-    let peak = peak_rss_bytes();
+    let peak = peak_rss_bytes().unwrap_or_default();
     let seq_end = prefill + decode;
     let meta = model.meta();
     let precision = model.precision();
@@ -69,9 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-/// Peak working set of the current process, in bytes (0 if unavailable).
+/// Peak working set of the current process, in bytes.
 #[cfg(windows)]
-fn peak_rss_bytes() -> u64 {
+fn peak_rss_bytes() -> Option<u64> {
     #[repr(C)]
     struct Pmc {
         cb: u32,
@@ -93,16 +97,12 @@ fn peak_rss_bytes() -> u64 {
     let mut pmc: Pmc = unsafe { std::mem::zeroed() };
     pmc.cb = std::mem::size_of::<Pmc>() as u32;
     let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
-    if ok == 0 {
-        0
-    } else {
-        pmc.peak_working_set_size as u64
-    }
+    (ok != 0).then_some(pmc.peak_working_set_size as u64)
 }
 
 /// `VmHWM` from `/proc/self/status` is the peak RSS, reported in kB.
-#[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
+#[cfg(target_os = "linux")]
+fn peak_rss_bytes() -> Option<u64> {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
@@ -112,10 +112,9 @@ fn peak_rss_bytes() -> u64 {
                 .and_then(|kb| kb.parse::<u64>().ok())
         })
         .map(|kb| kb * 1024)
-        .unwrap_or(0)
 }
 
-#[cfg(not(any(windows, unix)))]
-fn peak_rss_bytes() -> u64 {
-    0
+#[cfg(not(any(windows, target_os = "linux")))]
+fn peak_rss_bytes() -> Option<u64> {
+    None
 }

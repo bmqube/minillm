@@ -105,7 +105,7 @@ impl Hardware {
     pub fn probe(device: &Device) -> Self {
         Self {
             device: device.clone(),
-            physical_cores: num_cpus::get_physical().max(1),
+            physical_cores: usable_physical_cores(),
             logical_cores: num_cpus::get().max(1),
             simd_runtime: SimdFeatures::runtime(),
             simd_compiled: SimdFeatures::compiled(),
@@ -129,6 +129,15 @@ impl Hardware {
         }
         out
     }
+}
+
+/// Physical cores this process may actually use.
+///
+/// `num_cpus::get_physical` counts the whole machine, while `num_cpus::get`
+/// honours CPU affinity and cgroup quotas; under `docker --cpus=2` or `taskset`
+/// the smaller of the two is the real budget.
+pub fn usable_physical_cores() -> usize {
+    num_cpus::get_physical().min(num_cpus::get()).max(1)
 }
 
 /// Whether `device` can run a matmul and softmax at `dtype`.

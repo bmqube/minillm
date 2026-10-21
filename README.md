@@ -157,7 +157,7 @@ GPU build (requires a CUDA toolkit and a compatible driver):
 cargo build --release --features cuda
 ```
 
-Rust 1.87+ required. Some dependencies compile native code (`ring`,
+Rust 1.89+ required. Some dependencies compile native code (`ring`,
 `aws-lc-rs`, `onig_sys`), so a C toolchain is required: on Linux/macOS the
 system compiler is enough; on Windows use the MSVC build tools, or MSYS2
 `mingw-w64-gcc` with the `x86_64-pc-windows-gnu` Rust target.
@@ -220,7 +220,7 @@ the checkpoint's `config.json`, so the calling code is identical either way.
 once, then take one token per step.
 
 ```rust
-use minillm::generation::{Generator, SamplingConfig};
+use minillm::generation::{Generator, SamplingConfig, TextStream};
 use minillm::{device, loader};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -232,11 +232,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = SamplingConfig { temperature: 0.8, top_k: Some(40), top_p: Some(0.95) };
 
     let mut generator = Generator::new(model.as_ref());
+    // Decodes the completion so far, so a character split across tokens prints whole.
+    let mut text = TextStream::new(&tokenizer);
     generator.prefill(&ids)?;
 
     for _ in 0..40 {
-        let next = generator.next_token(&cfg)?;
-        print!("{}", tokenizer.decode(&[next], false)?);
+        print!("{}", text.push(generator.next_token(&cfg)?)?);
     }
     Ok(())
 }
@@ -269,6 +270,7 @@ Other entry points:
 | | |
 |---|---|
 | `Generator::with_quant(model, KvQuant::Int8)` | quantized KV cache |
+| `generation::TextStream::new(&tokenizer)` | streaming detokenization that keeps multi-byte characters whole |
 | `generation::greedy(model, &ids, n, quant)` | one-shot greedy decode |
 | `generation::greedy_no_cache(model, &ids, n)` | the O(n²) reference path |
 | `generation::sample_with(&logits, &cfg, &mut rng)` | seeded, reproducible sampling |
@@ -277,8 +279,8 @@ Other entry points:
 | `loader::load_with(spec, &dev, Some(Precision::BF16))` | pin the weight dtype |
 | `model.meta()` | layers, q/kv heads, `head_dim`, context, params, KV bytes/token |
 
-Greedy decoding (`temperature <= 1e-6`, no `top_k`/`top_p`) consumes no
-randomness, so every benchmark in this repo is deterministic. For reproducible
+Greedy decoding (`temperature <= 1e-6`; `top_k`/`top_p` cannot change the
+argmax, so they are ignored) consumes no randomness, so every benchmark in this repo is deterministic. For reproducible
 *sampled* output, pass a seeded RNG:
 
 ```rust

@@ -49,11 +49,7 @@ impl Qwen3Model {
                 cfg.num_attention_heads, cfg.num_key_value_heads
             )));
         }
-        if let Some(scaling) = &cfg.rope_scaling {
-            return Err(candle_core::Error::Msg(format!(
-                "unsupported rope_scaling {scaling}: only plain RoPE is implemented"
-            )));
-        }
+        let rope_theta = cfg.plain_rope_theta().map_err(candle_core::Error::Msg)?;
 
         let model = vb.pp("model");
         let embed_tokens =
@@ -85,7 +81,7 @@ impl Qwen3Model {
         let rope = RotaryEmbedding::new(
             cfg.head_dim,
             cfg.max_position_embeddings,
-            cfg.rope_theta,
+            rope_theta,
             precision.dtype(),
             &device,
         )?;
@@ -209,5 +205,70 @@ impl CausalLM for Qwen3Model {
     fn forward_with_cache_last(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         let hidden = self.hidden_states_with_cache(input_ids, cache)?;
         last_position_logits(&hidden, &self.lm_head)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generation::{greedy, greedy_no_cache};
+    use crate::kv_cache::KvQuant;
+    use candle_core::{DType, IndexOp};
+    use candle_nn::VarMap;
+
+    /// A 2-layer random-weight Qwen3 whose layers from `window_from` on attend
+    /// through a 3-key window (`None`: windowing off). Models built from the
+    /// same `VarMap` share weights.
+    fn tiny(vars: &VarMap, window_from: Option<usize>) -> Qwen3Model {
+        let cfg: Qwen3Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 32, "hidden_size": 16, "intermediate_size": 32,
+            "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 8,
+            "max_position_embeddings": 64, "sliding_window": 3,
+            "use_sliding_window": window_from.is_some(),
+            "max_window_layers": window_from.unwrap_or(0)
+        }))
+        .unwrap();
+        let vb = VarBuilder::from_varmap(vars, DType::F32, &Device::Cpu);
+        Qwen3Model::new(&cfg, vb).unwrap()
+    }
+
+    #[test]
+    fn sliding_window_cache_path_matches_recompute() {
+        let vars = VarMap::new();
+        let model = tiny(&vars, Some(1));
+        let prompt: Vec<u32> = (1..9).collect(); // longer than the window
+        assert_eq!(
+            greedy(&model, &prompt, 6, KvQuant::None).unwrap(),
+            greedy_no_cache(&model, &prompt, 6).unwrap()
+        );
+    }
+
+    #[test]
+    fn sliding_window_changes_what_late_positions_see() {
+        let vars = VarMap::new();
+        let (layer1, both, global) = (
+            tiny(&vars, Some(1)),
+            tiny(&vars, Some(0)),
+            tiny(&vars, None),
+        );
+        let ids = Tensor::new(&[[1u32, 2, 3, 4, 5, 6, 7, 8]], &Device::Cpu).unwrap();
+        let last = |m: &Qwen3Model| m.forward_last(&ids).unwrap().i(0).unwrap();
+        let first = |m: &Qwen3Model| m.forward(&ids).unwrap().i((0, 0)).unwrap();
+        let diff = |a: Tensor, b: Tensor| {
+            (a - b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+        // Position 0 is inside every window; position 7 is not.
+        assert_eq!(diff(first(&layer1), first(&global)), 0.0);
+        assert!(diff(last(&layer1), last(&global)) > 1e-4);
+        // And the window reaches only the layers it is configured for.
+        assert!(diff(last(&layer1), last(&both)) > 1e-4);
     }
 }

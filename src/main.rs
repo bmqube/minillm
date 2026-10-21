@@ -9,7 +9,7 @@
 //! precision follows the checkpoint's own `torch_dtype`.
 
 use minillm::generation::{Generator, SamplingConfig};
-use minillm::{device, loader};
+use minillm::{loader, ExecutionPlan};
 use std::time::Instant;
 
 const DEFAULT_MODEL: &str = "openai-community/gpt2";
@@ -22,8 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let model_id = args.next().unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let prompt = args.next().unwrap_or_else(|| DEFAULT_PROMPT.to_string());
 
-    let device = device::best();
-    eprintln!("device: {device:?}");
+    let plan = ExecutionPlan::detect();
+    plan.log();
+    let device = plan.device().clone();
 
     let (model, tokenizer) = loader::load(&model_id, &device)?;
     let meta = model.meta();

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release --bin sweep -- [MODELS] [PREFILLS] [DECODE] [CACHE] [KVQUANT]
-//!     [--repeats N] [--precision f32|f16|bf16] > benchmarks/sweep_cpu.csv
+//!     [--repeats N] [--precision f32|f16|bf16] [--threads N] > benchmarks/sweep_cpu.csv
 //! ```
 //!
 //! Defaults: `benchmarks/gpt2  32,64,128,256,512  64  both  none  --repeats 1`.
@@ -17,6 +17,8 @@
 //! - `--repeats` how many timed trials per configuration (default 1).
 //! - `--precision` pin the weight dtype; default is the checkpoint's own
 //!   `torch_dtype`, so GPT-2 stays fp32 and Qwen3 loads bf16.
+//! - `--threads` CPU worker threads; default is the physical core count (see
+//!   [`ExecutionPlan`]).
 //!
 //! Emits **one CSV row per trial** — `(model, prefill, kv_cache, repeat)` — to
 //! stdout, so downstream analysis can compute its own error bars; a mean ± std
@@ -28,8 +30,9 @@ use candle_core::{IndexOp, Tensor};
 use minillm::dtype::Precision;
 use minillm::generation::{greedy_no_cache, Generator, GREEDY};
 use minillm::kv_cache::KvQuant;
+use minillm::loader;
 use minillm::models::CausalLM;
-use minillm::{device, loader};
+use minillm::plan::{ExecutionPlan, PlanOverrides};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -40,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut positional: Vec<String> = Vec::new();
     let mut repeats: usize = 1;
     let mut precision: Option<Precision> = None;
+    let mut threads: Option<usize> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -55,6 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 precision = Some(
                     Precision::parse(&v)
                         .unwrap_or_else(|| panic!("--precision expects f32|f16|bf16, got {v:?}")),
+                );
+            }
+            "--threads" => {
+                let v = it.next().unwrap_or_default();
+                threads = Some(
+                    v.parse()
+                        .unwrap_or_else(|_| panic!("--threads expects a number, got {v:?}")),
                 );
             }
             _ => positional.push(a),
@@ -79,9 +90,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let kv_quant = KvQuant::parse(&kvq_arg)
         .unwrap_or_else(|| panic!("KVQUANT expects none|int8|int4, got {kvq_arg:?}"));
 
-    let dev = device::best();
-    let dev_str = format!("{dev:?}");
-    eprintln!("device       : {dev_str}");
+    let plan = ExecutionPlan::with(PlanOverrides { threads });
+    plan.log();
+    let dev = plan.device().clone();
+    let dev_str = plan.device_label();
+    let n_threads = plan.threads;
+    let cpu_simd = plan.hardware.simd_compiled.label();
     eprintln!("models       : {models:?}");
     eprintln!("prefills     : {prefills:?}");
     eprintln!("decode steps : {decode}");
@@ -96,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(
         "model,arch,params,n_kv_head,kv_bytes_per_token,device,dtype,kv_cache,kv_quant,repeat,\
          prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,\
-         prefill_tok_s,decode_tok_s,decode_s"
+         prefill_tok_s,decode_tok_s,decode_s,threads,cpu_simd"
     );
 
     // config label -> decode tok/s across trials, for the stderr summary.
@@ -156,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "{model_id},{arch},{params},{n_kv_head},{kv_bpt},{dev_str},{dtype},\
                              {kv},{quant},{repeat},{prefill},{decode},{prefill},{},\
                              {load_s:.3},{prefill_ms:.1},{prefill_tok_s:.2},\
-                             {decode_tok_s:.3},{decode_s:.3}",
+                             {decode_tok_s:.3},{decode_s:.3},{n_threads},{cpu_simd}",
                             prefill + decode
                         );
                     };

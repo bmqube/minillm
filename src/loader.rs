@@ -239,8 +239,8 @@ pub fn load_files(
     let precision = match precision {
         Some(p) if !p.is_supported_on(device) => {
             return Err(format!(
-                "{p} is not supported on {device:?} (candle has no CPU bf16 gemm). \
-                 Re-run with f32, or use a CUDA device."
+                "{p} is not supported on {device:?} (candle has no CPU bf16 gemm; \
+                 CUDA bf16 needs an Ampere or newer GPU). Re-run with f32."
             )
             .into())
         }

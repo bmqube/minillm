@@ -44,7 +44,7 @@
 
 use candle_core::{DType, IndexOp, Tensor};
 use minillm::kv_cache::{KvCache, KvQuant};
-use minillm::{device, loader};
+use minillm::{loader, ExecutionPlan};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -81,8 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "need 1 <= STRIDE <= WINDOW"
     );
 
-    let dev = device::best();
-    eprintln!("device   : {dev:?}");
+    let plan = ExecutionPlan::detect();
+    plan.log();
+    let dev = plan.device().clone();
     eprintln!("model    : {model_id}");
     eprintln!("text     : {text_path}");
     eprintln!("window   : {window}   stride : {stride}   max_tokens : {max_tokens}");

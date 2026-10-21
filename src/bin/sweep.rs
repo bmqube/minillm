@@ -23,10 +23,10 @@
 //! Emits **one CSV row per trial** — `(model, prefill, kv_cache, repeat)` — to
 //! stdout, so downstream analysis can compute its own error bars; a mean ± std
 //! summary is printed to stderr. Decode throughput on a loaded CPU varies
-//!15-20% run to run, so any headline number should come from `--repeats 5` or
+//! 15-20% run to run, so any headline number should come from `--repeats 5` or
 //! more, not a single trial.
 
-use candle_core::{IndexOp, Tensor};
+use candle_core::{DType, IndexOp, Tensor};
 use minillm::dtype::Precision;
 use minillm::generation::{greedy_no_cache, Generator, GREEDY};
 use minillm::kv_cache::KvQuant;
@@ -152,7 +152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // Warm-up (lazy alloc / kernel selection) — not timed, once per config.
             let warm = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-            let _ = model.forward_last(&warm)?.i(0)?.to_vec1::<f32>()?;
+            let _ = model
+                .forward_last(&warm)?
+                .i(0)?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
 
             for repeat in 1..=repeats {
                 // Prefill (full forward over the prompt, only the final position's
@@ -160,7 +164,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // actually needs), timed per trial.
                 let t1 = Instant::now();
                 let input = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
-                let _ = model.forward_last(&input)?.i(0)?.to_vec1::<f32>()?;
+                let _ = model
+                    .forward_last(&input)?
+                    .i(0)?
+                    .to_dtype(DType::F32)?
+                    .to_vec1::<f32>()?;
                 let prefill_ms = t1.elapsed().as_secs_f64() * 1e3;
                 let prefill_tok_s = prefill as f64 / (prefill_ms / 1e3);
 

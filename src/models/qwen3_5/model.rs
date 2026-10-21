@@ -1,4 +1,4 @@
-use candle_core::{Device, IndexOp, Module, Result, Tensor};
+use candle_core::{Device, Module, Result, Tensor};
 use candle_nn::{Embedding, Linear, VarBuilder};
 
 use super::block::Qwen35Block;
@@ -7,7 +7,7 @@ use super::norm::ZeroCenteredRmsNorm;
 use crate::dtype::Precision;
 use crate::kv_cache::{KvCache, KvQuant};
 use crate::layers::{mask, RotaryEmbedding};
-use crate::models::{check_cache, CausalLM, ModelMeta};
+use crate::models::{check_cache, last_position_logits, CausalLM, ModelMeta};
 
 pub struct Qwen35Model {
     cfg: Qwen35Config,
@@ -88,6 +88,7 @@ impl Qwen35Model {
         let (past, total) = check_cache(
             cache,
             self.blocks.len(),
+            |i| self.cfg.layer_kind(i),
             seq_len,
             self.cfg.max_position_embeddings,
         )?;
@@ -110,11 +111,6 @@ impl Qwen35Model {
             hidden = block.forward(&hidden, m.as_ref(), cache, i, past, &self.rope)?;
         }
         self.norm.forward(&hidden)
-    }
-
-    fn last_position(&self, hidden: Tensor) -> Result<Tensor> {
-        let last = hidden.dim(1)? - 1;
-        hidden.i((.., last, ..))?.apply(&self.lm_head)
     }
 }
 
@@ -143,8 +139,7 @@ impl CausalLM for Qwen35Model {
 
     fn forward_last(&self, input_ids: &Tensor) -> Result<Tensor> {
         let mut cache = self.new_cache();
-        let hidden = self.hidden_states(input_ids, &mut cache)?;
-        self.last_position(hidden)
+        last_position_logits(&self.hidden_states(input_ids, &mut cache)?, &self.lm_head)
     }
 
     fn forward_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
@@ -152,8 +147,7 @@ impl CausalLM for Qwen35Model {
     }
 
     fn forward_with_cache_last(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
-        let hidden = self.hidden_states(input_ids, cache)?;
-        self.last_position(hidden)
+        last_position_logits(&self.hidden_states(input_ids, cache)?, &self.lm_head)
     }
 
     fn new_cache_with(&self, quant: KvQuant) -> KvCache {

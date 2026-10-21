@@ -13,10 +13,11 @@
 //! along `dim = 2` (the sequence axis).
 //!
 //! Under grouped-query attention `n_kv_head < n_head`, and it is the **narrow**
-//! `n_kv_head` tensor that is cached; expanding to one key/value per query head
-//! ([`crate::layers::repeat_kv`]) happens after the read, per step, and is never
-//! stored. Caching the expanded copy would multiply the footprint by the group
-//! count — 8x on Qwen3-8B — for no information gain.
+//! `n_kv_head` tensor that is cached. Attention reads it as is
+//! ([`crate::layers::grouped_attention`] folds each query group onto its KV
+//! head), so the expanded copy is never built, let alone stored. Caching it
+//! would multiply the footprint by the group count — 8x on Qwen3-8B — for no
+//! information gain.
 //!
 //! # Cost — and what this implementation does *not* do
 //!
@@ -109,9 +110,12 @@ pub enum KvQuant {
 
 impl KvQuant {
     /// Parse `"none"` / `"int8"` / `"int4"` (case-insensitive).
+    ///
+    /// There is deliberately no `"fp32"` alias: [`Self::None`] stores the
+    /// model's own precision, which is bf16 for most checkpoints.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "none" | "off" | "fp32" | "f32" => Some(Self::None),
+            "none" | "off" => Some(Self::None),
             "int8" | "i8" | "8" => Some(Self::Int8),
             "int4" | "i4" | "4" => Some(Self::Int4),
             _ => None,
@@ -1067,6 +1071,7 @@ mod tests {
     fn quant_parses_and_displays() {
         assert_eq!(KvQuant::parse("INT8"), Some(KvQuant::Int8));
         assert_eq!(KvQuant::parse("off"), Some(KvQuant::None));
+        assert_eq!(KvQuant::parse("fp32"), None);
         assert_eq!(KvQuant::parse("int3"), None);
         assert_eq!(KvQuant::Int4.to_string(), "int4");
     }

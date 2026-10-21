@@ -99,17 +99,6 @@ impl GPT2Config {
         embeddings + self.n_layer * per_block + 2 * e // + final LayerNorm
     }
 
-    /// Analytic size of the KV cache per sequence position, in bytes, when the
-    /// cached keys/values are stored at `dtype_bytes` bytes per element.
-    ///
-    /// Each layer caches a key tensor and a value tensor, each with `n_embd`
-    /// (`= n_head * head_dim`) elements per position, hence the factor of two.
-    /// For `gpt2` base at fp32 this is `2 * 12 * 768 * 4` = 73,728 B/token
-    /// (72 KiB); a full 1024-token context costs ~72 MiB.
-    pub fn kv_cache_bytes_per_token(&self, dtype_bytes: usize) -> usize {
-        2 * self.n_layer * self.n_embd * dtype_bytes
-    }
-
     /// Architecture-independent view of this config.
     pub fn meta(&self) -> ModelMeta {
         ModelMeta {
@@ -143,19 +132,10 @@ mod tests {
 
     #[test]
     fn gpt2_base_kv_cache_is_72kib_per_token_fp32() {
+        // 2 (K, V) * 12 layers * 768 wide * 4 B; a full 1024-token context is ~72 MiB.
         assert_eq!(
-            GPT2Config::default().kv_cache_bytes_per_token(4),
-            2 * 12 * 768 * 4
-        );
-        assert_eq!(GPT2Config::default().kv_cache_bytes_per_token(4), 73_728);
-    }
-
-    #[test]
-    fn meta_agrees_with_the_config_level_kv_formula() {
-        let cfg = GPT2Config::default();
-        assert_eq!(
-            cfg.meta().kv_cache_bytes_per_token(4),
-            cfg.kv_cache_bytes_per_token(4)
+            GPT2Config::default().meta().kv_cache_bytes_per_token(4),
+            73_728
         );
     }
 

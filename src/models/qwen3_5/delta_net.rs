@@ -202,6 +202,81 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::*;
     use candle_core::Device;
+    use std::collections::HashMap;
+
+    fn config(n_k_heads: usize) -> Qwen35Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 16, "hidden_size": 8, "intermediate_size": 16,
+            "num_hidden_layers": 1, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 4,
+            "linear_num_key_heads": n_k_heads, "linear_num_value_heads": 4,
+            "linear_key_head_dim": 4, "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 4, "max_position_embeddings": 64,
+            "rope_parameters": {"rope_theta": 10000.0}
+        }))
+        .unwrap()
+    }
+
+    /// Rows `[q | k | v]` of a 2-key-head layout, rewritten for 4 key heads
+    /// where key head `h` is a copy of original head `h / 2`.
+    fn duplicate_key_heads(t: &Tensor) -> Tensor {
+        let head = |i: usize| t.narrow(0, i * 4, 4).unwrap();
+        // q: heads 0, 1; k: heads 2, 3; v: rows 16.. untouched.
+        let rows = [head(0), head(0), head(1), head(1)]
+            .into_iter()
+            .chain([head(2), head(2), head(3), head(3)])
+            .chain([t.narrow(0, 16, 16).unwrap()])
+            .collect::<Vec<_>>();
+        Tensor::cat(&rows, 0).unwrap()
+    }
+
+    #[test]
+    fn value_head_h_reads_key_head_h_over_rep() {
+        // 4 value heads over 2 key heads must equal 4 value heads over 4 key
+        // heads whose key head h is a copy of head h / 2 — the
+        // repeat_interleave mapping. The equal-heads path is the one checked
+        // against the reference checkpoint.
+        let dev = Device::Cpu;
+        let rand = |shape: &[usize]| Tensor::randn(0f32, 0.5, shape, &dev).unwrap();
+        let mut grouped = HashMap::new();
+        grouped.insert("in_proj_qkv.weight".to_string(), rand(&[32, 8]));
+        grouped.insert("conv1d.weight".to_string(), rand(&[32, 1, 4]));
+        grouped.insert("in_proj_z.weight".to_string(), rand(&[16, 8]));
+        grouped.insert("in_proj_b.weight".to_string(), rand(&[4, 8]));
+        grouped.insert("in_proj_a.weight".to_string(), rand(&[4, 8]));
+        grouped.insert("A_log".to_string(), rand(&[4]));
+        grouped.insert("dt_bias".to_string(), rand(&[4]));
+        grouped.insert("norm.weight".to_string(), rand(&[4]));
+        grouped.insert("out_proj.weight".to_string(), rand(&[8, 16]));
+
+        let mut expanded = grouped.clone();
+        for name in ["in_proj_qkv.weight", "conv1d.weight"] {
+            expanded.insert(name.to_string(), duplicate_key_heads(&grouped[name]));
+        }
+
+        let net = |cfg, map| {
+            GatedDeltaNet::new(&cfg, VarBuilder::from_tensors(map, DType::F32, &dev)).unwrap()
+        };
+        let (a, b) = (net(config(2), grouped), net(config(4), expanded));
+
+        let x = rand(&[1, 5, 8]);
+        let ya = a.forward(&x, &mut RecurrentCache::new()).unwrap();
+        let yb = b.forward(&x, &mut RecurrentCache::new()).unwrap();
+        let diff = (ya - yb)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "grouped vs expanded key heads differ by {diff}"
+        );
+    }
 
     #[test]
     fn softplus_matches_the_definition() {

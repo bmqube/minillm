@@ -2,8 +2,12 @@
 name = "minillm"
 version = "0.3.0"
 edition = "2021"
+# `usize::is_multiple_of` is stable from 1.87.
+rust-version = "1.87"
+# `cargo run` with no `--bin` runs the CLI demo, as the README shows.
+default-run = "minillm"
 authors = ["BM Monjur Morshed"]
-description = "A small GPT-2 inference engine in Rust, built on candle"
+description = "A small transformer inference engine (GPT-2, Qwen3, Qwen3.5) in Rust, built on candle"
 license = "MIT"
 repository = "https://github.com/bmqube/minillm"
 homepage = "https://github.com/bmqube/minillm"

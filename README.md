@@ -157,7 +157,7 @@ GPU build (requires a CUDA toolkit and a compatible driver):
 cargo build --release --features cuda
 ```
 
-Rust 1.74+ recommended. Some dependencies compile native code (`ring`,
+Rust 1.87+ required. Some dependencies compile native code (`ring`,
 `aws-lc-rs`, `onig_sys`), so a C toolchain is required: on Linux/macOS the
 system compiler is enough; on Windows use the MSVC build tools, or MSYS2
 `mingw-w64-gcc` with the `x86_64-pc-windows-gnu` Rust target.

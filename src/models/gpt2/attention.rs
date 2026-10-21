@@ -3,6 +3,7 @@ use candle_nn::{Linear, VarBuilder};
 
 use super::config::GPT2Config;
 use crate::kv_cache::LayerKvCache;
+use crate::layers::grouped_attention;
 
 pub struct MultiHeadAttention {
     c_attn: Linear, // Combined Q, K, V projection
@@ -54,22 +55,9 @@ impl MultiHeadAttention {
     /// `mask` is `[q_len, kv_len]`. Returns `[batch, q_len, n_embd]` after the
     /// output projection.
     fn attend(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let (batch_size, _, q_len, head_dim) = q.dims4()?;
-        let scale = 1.0 / (head_dim as f64).sqrt();
-
-        // `.transpose()` alone is a free stride-swap (candle's CPU matmul takes
-        // strided layouts directly, the same way it does for the `.t()`-loaded
-        // Linear weights elsewhere in this crate); the `.contiguous()` that used
-        // to follow it forced a full copy of `k` on every attend() call.
-        let scores = q.matmul(&k.transpose(2, 3)?)?;
-        let mut scores = (scores * scale)?;
-
-        if let Some(mask) = mask {
-            scores = scores.broadcast_add(mask)?;
-        }
-
-        let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = attn_weights.matmul(v)?;
+        let (batch_size, _, q_len, _) = q.dims4()?;
+        // Plain multi-head attention: one query head per KV head.
+        let out = grouped_attention(q, k, v, mask, 1)?;
 
         // Concatenate heads and project.
         let out = out

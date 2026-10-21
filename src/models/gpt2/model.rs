@@ -1,12 +1,12 @@
-use candle_core::{Device, IndexOp, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
 
 use super::block::TransformerBlock;
 use super::config::GPT2Config;
 use crate::dtype::Precision;
-use crate::kv_cache::KvCache;
+use crate::kv_cache::{KvCache, LayerKind};
 use crate::layers::mask;
-use crate::models::{check_cache, CausalLM, ModelMeta};
+use crate::models::{check_cache, last_position_logits, CausalLM, ModelMeta};
 
 pub struct GPT2Model {
     cfg: GPT2Config,
@@ -119,7 +119,13 @@ impl GPT2Model {
     /// Cache-aware counterpart of [`hidden_states`](Self::hidden_states).
     fn hidden_states_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
-        let (past, total) = check_cache(cache, self.blocks.len(), seq_len, self.cfg.n_ctx)?;
+        let (past, total) = check_cache(
+            cache,
+            self.blocks.len(),
+            |_| LayerKind::Attention,
+            seq_len,
+            self.cfg.n_ctx,
+        )?;
 
         let positions = Tensor::arange(past as i64, total as i64, input_ids.device())?
             .unsqueeze(0)?
@@ -169,9 +175,7 @@ impl CausalLM for GPT2Model {
     }
 
     fn forward_last(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let hidden_states = self.hidden_states(input_ids)?;
-        let last = hidden_states.dim(1)? - 1;
-        hidden_states.i((.., last, ..))?.apply(&self.lm_head)
+        last_position_logits(&self.hidden_states(input_ids)?, &self.lm_head)
     }
 
     fn forward_with_cache(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
@@ -181,7 +185,6 @@ impl CausalLM for GPT2Model {
 
     fn forward_with_cache_last(&self, input_ids: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         let hidden_states = self.hidden_states_with_cache(input_ids, cache)?;
-        let last = hidden_states.dim(1)? - 1;
-        hidden_states.i((.., last, ..))?.apply(&self.lm_head)
+        last_position_logits(&hidden_states, &self.lm_head)
     }
 }

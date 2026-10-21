@@ -183,7 +183,9 @@ cargo run --release --bin sweep -- benchmarks/gpt2 16,64,128,256,512 32 both > b
 # args: MODELS(comma-sep dirs/ids)  PREFILLS(comma-sep)  DECODE(steps)  CACHE(off|on|both)
 ```
 
-Columns: `model,params,kv_bytes_per_token,device,dtype,kv_cache,kv_quant,prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,prefill_tok_s,decode_tok_s,decode_s`.
+Columns: `model,arch,params,n_kv_head,kv_bytes_per_token,device,dtype,kv_cache,kv_quant,repeat,prefill_tokens,decode_steps,seq_start,seq_end,load_s,prefill_ms,prefill_tok_s,decode_tok_s,decode_s,threads,cpu_simd`.
+`threads` and `cpu_simd` (the SIMD extensions compiled into the binary) come
+from the execution plan; CSVs written before they existed simply lack them.
 `kv_bytes_per_token` is the analytic retained cache cost per position for that
 row's `kv_quant` (§6); `kv_quant` is `none` on `off` rows.
 
@@ -426,8 +428,10 @@ consistent with the other rows.)
 > implementation choices, not properties of low-bit KV:
 >
 > 1. `append` grows the cache with `Tensor::cat`, copying the whole cache every
->    decode step. Applies to fp32 too, and is why even the fp32 cached path
->    decays with length.
+>    decode step. When these numbers were taken this applied to fp32 too, and is
+>    why even the fp32 cached path decays with length. Full precision now writes
+>    into a preallocated buffer instead (see `kv_cache.rs`); the quantized modes
+>    still `cat`.
 > 2. Quantized modes **dequantize the entire cache to fp32 every step** so the
 >    attention matmul stays fp32 — a second O(n) pass per step, heavier for int4
 >    (nibble unpack) than int8 (byte cast).
@@ -506,3 +510,70 @@ tokens of WikiText-2 and would either confirm the gap or show it is an artifact
 of one prompt. What it already does establish is narrower but solid: **"int8 KV
 cache is free" is a claim about an architecture, not about int8**, and a study
 that only ever ran GPT-2 could not have noticed.
+
+## 9. Execution plan, preallocated cache, grouped attention
+
+Three changes to the decode path, measured together against the build before
+them: the execution plan pinning CPU threads to the physical core count, the
+full-precision KV cache writing into a preallocated buffer instead of
+`Tensor::cat`, and grouped-query attention without the `repeat_kv` copy of K/V.
+
+Environment: same Ryzen 5 5600G, but under **WSL2 (Ubuntu, 13 GiB visible)**
+rather than native Windows, so absolute numbers are not comparable with §1–§8.
+Run-to-run drift on this box is large (the same binary and settings gave 25.6
+and 36.9 tok/s in two sessions), so every configuration below ran in the same
+session, alternating, two rounds of `--repeats 2`. 64 greedy decode steps, KV
+cache on, fp32. Mean ± sample std of the 4 trials.
+
+```bash
+sweep benchmarks/gpt2,benchmarks/qwen3-0.6b 64,512,960 64 on none --repeats 2
+```
+
+| model | prefill | before | before, `RAYON_NUM_THREADS=6` | after | after / before |
+|---|---|---|---|---|---|
+| gpt2 124M | 64  | 23.52 ± 0.33 | 37.09 ± 0.33 | 36.03 ± 2.82 | 1.53× |
+| gpt2 124M | 512 | 20.73 ± 0.37 | 31.45 ± 1.39 | 35.03 ± 0.30 | 1.69× |
+| gpt2 124M | 960 | 18.92 ± 0.20 | 27.54 ± 0.69 | 34.56 ± 0.09 | 1.83× |
+| Qwen3 0.6B | 64  | 6.51 ± 0.07 | 9.62 ± 0.28 | 10.42 ± 0.13 | 1.60× |
+| Qwen3 0.6B | 512 | 5.06 ± 0.09 | 6.84 ± 0.11 | 8.88 ± 0.06 | 1.75× |
+| Qwen3 0.6B | 960 | 4.25 ± 0.02 | 5.33 ± 0.05 | 8.04 ± 0.08 | 1.89× |
+
+Reading the columns:
+
+- **Threads (first → second column), ~1.4–1.6×.** candle's own pool and the
+  task count it hands `gemm` both default to the physical cores (6), but `gemm`
+  runs those tasks on rayon's *global* pool, which without `RAYON_NUM_THREADS`
+  spawns one thread per logical CPU (12). Setting the variable sizes that pool
+  to 6 as well. The speedup is measured; which mechanism produces it (tasks
+  landing on SMT siblings, or the oversized pool itself) has not been
+  isolated. The execution plan now sets the variable before either pool exists.
+- **Cache and attention (second → third), 1.0× at short context, 1.26× (GPT-2)
+  and 1.51× (Qwen3) at 960.** The removed copies were O(n) per step, so the gain
+  grows with context; Qwen3 gains more because it also lost the `repeat_kv`
+  expansion. Cached decode is now nearly flat in context length (GPT-2: 36.0 at
+  64 → 34.6 at 960, against 23.5 → 18.9 before).
+
+Correctness: logits from the new build are **bit-identical** to the old one on
+all 24 parity prompts, both models, on the cache path (max |Δlogit| = 0), so the
+§2 HuggingFace parity results carry over unchanged. All 8 `cache_parity` tests
+pass.
+
+**`target-cpu=native` does not move these numbers.** Same code, built with and
+without it, alternating, same method:
+
+| model | prefill | baseline x86-64 build | native build |
+|---|---|---|---|
+| gpt2 124M | 64  | 35.72 ± 0.14 | 36.06 ± 1.41 |
+| gpt2 124M | 960 | 30.96 ± 0.10 | 31.33 ± 0.96 |
+| Qwen3 0.6B | 64  | 10.04 ± 0.16 | 9.96 ± 0.13 |
+| Qwen3 0.6B | 960 | 7.76 ± 0.14 | 7.69 ± 0.11 |
+
+As expected: fp32 matmul goes through the `gemm` crate, which picks its SIMD at
+run time. The flag matters for the paths candle gates at compile time, f16/bf16
+dot products and the quantized matmuls, none of which an fp32 run touches.
+
+**One drift figure does not reproduce here.** Under WSL2, `cache_parity` reports
+Qwen3 int4 drift of 4.007 σ (int8 0.266 σ) on unmodified `main` and on this
+build alike, against the 3.525 σ (int8 0.268 σ) in §8, which was measured on
+Windows. The int8 figure and every top-1 outcome agree; the int4 gap is a
+platform difference, not a regression.

@@ -43,6 +43,28 @@ throughput looks like the CPU numbers, check the build flags first.
 
 Select a specific GPU on a multi-GPU box with `CUDA_VISIBLE_DEVICES=0`.
 
+### 1.1 First-run checklist
+
+The hardware-adaptive paths (dtype probe, preallocated KV cache read through
+cuBLAS as a strided view, grouped-query attention without `repeat_kv`, greedy
+argmax on the device) were written and tested on CPU only. Before recording any
+number, confirm they behave on the GPU:
+
+```bash
+./target/release/bench benchmarks/qwen3-0.6b 16 8
+```
+
+1. The first line is the execution plan. It must read `device=cuda`,
+   `half=bf16+f16` and `argmax=device`.
+   - `device=cpu`: the build lacks `--features cuda`.
+   - `half=f16` or `half=none` on an Ampere-or-newer card: the bf16 probe in
+     `hardware::supports` failed. The model will load at fp32; record the
+     card and driver and report it.
+2. `precision : bf16` and no `note: checkpoint is bf16 ...` line.
+3. Then run the §4.2 gate. A `MatMulNonContiguous` error there means cuBLAS
+   rejected the cache view, which is a bug in this crate, not a setup
+   problem; record the full message.
+
 ---
 
 ## 2. Fetch the checkpoints
@@ -181,6 +203,11 @@ for q in none int8 int4; do
 done
 ```
 
+Every row ends with `threads` and `cpu_simd`, the CPU side of the execution
+plan. On a GPU run they describe only the host, but keep them: CPU rows from the
+same machine are worth adding (build once without `--features cuda` into a
+separate `--target-dir`), and the columns say which is which.
+
 `--repeats 5` minimum for anything you plan to cite. A GPU is far less noisy
 than a loaded CPU, but the first iteration still pays for lazy kernel selection;
 the harness does one untimed warm-up per config.
@@ -255,7 +282,9 @@ contrast is a result, and overwriting it loses the comparison.
 |---|---|
 | `no kernel image is available` | CUDA toolkit too old for the GPU's compute capability (need 12.8+ for a 5090) |
 | Throughput matches CPU | built without `--features cuda` |
-| `unsupported dtype BF16 for op matmul` | running on CPU after all — check `device::best()` picked CUDA |
+| `unsupported dtype BF16 for op matmul` | running on CPU after all — check the plan line says `device=cuda` |
+| the plan line says `half=f16` on an RTX 30/40/50 card | the bf16 probe failed; see §1.1 |
+| `MatMulNonContiguous` in the cache gate | cuBLAS rejected the strided KV-cache view; a crate bug, see §1.1 |
 | `CUDA out of memory` on a long-context row | KV cache: lower the prefill, or use `int8` |
 | Parity fails only at bf16 | expected — run the parity gate at `--precision f32`, see §4.1 |
 | Wildly variable first trial | lazy kernel selection; the harness warms up once per config, raise `--repeats` |

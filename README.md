@@ -50,10 +50,19 @@ If you want to see the transformer built without a tensor framework, read the
   still matches HuggingFace to fp32 noise. The plain `forward` is kept as the
   reference and pre-cache baseline; both it and the cached path skip the LM head
   on positions the caller won't use (`forward_last` / `forward_with_cache_last`).
-- **Grouped-query attention is respected in the cache.** Only the narrow
-  `n_kv_head` tensors are stored; `repeat_kv` expands to the query head count
-  per step and is never cached. On Qwen3-0.6B (16 query heads over 8 KV heads)
-  that is a 2× smaller cache before any quantization.
+- **Grouped-query attention is respected in the cache and in the math.** Only
+  the narrow `n_kv_head` tensors are stored, and attention folds each KV head's
+  group of query heads into one matmul instead of materialising an expanded
+  copy of K/V every step. On Qwen3-0.6B (16 query heads over 8 KV heads) that is
+  a 2× smaller cache before any quantization.
+- **Preallocated cache buffer.** At full precision K/V are written in place
+  into a buffer that doubles when full, and attention reads a strided view of
+  it, so a decode step no longer copies the whole cache.
+- **Hardware-aware execution plan.** At startup the engine probes the device
+  (which half-precision dtypes actually run there), the CPU (physical cores,
+  SIMD features available vs. compiled in) and picks thread count, weight
+  precision and where greedy argmax runs. Every binary prints the plan and
+  `sweep` records it in each CSV row. See [Hardware](#hardware).
 - **Quantized KV cache.** `KvQuant::Int8` (per-token symmetric) is 3.76× smaller
   and `KvQuant::Int4` (per-token asymmetric, packed) 6.4× smaller. On GPT-2 int8
   costs effectively nothing (Δppl ≈ +0.008 on WikiText-2) — **but that result
@@ -78,6 +87,8 @@ src/
 ├── loader.rs       config parsing, architecture dispatch, sharded safetensors, precision choice
 ├── dtype.rs        Precision (f32/f16/bf16) + what each device can actually run
 ├── device.rs       pick CUDA if built with --features cuda, else CPU
+├── hardware.rs     probe: cores, CPU SIMD (available vs. compiled in), half-precision support
+├── plan.rs         ExecutionPlan: the hardware-dependent choices for a run
 ├── generation.rs   Generator (decode loop) + SamplingConfig / sample(): greedy / temp / top-k / top-p
 ├── kv_cache.rs     KvCache / LayerKvCache: per-layer K/V, model precision or per-token int8 / int4
 │
@@ -85,7 +96,7 @@ src/
 │   ├── activation.rs  tanh-approx GELU (GPT-2's gelu_new) + SiLU (Qwen3's SwiGLU gate)
 │   ├── mask.rs        additive causal + sliding-window masks, dtype-aware
 │   ├── rope.rs        rotary embeddings, offset-aware for cached decode
-│   └── mod.rs         repeat_kv: GQA head expansion
+│   └── mod.rs         grouped_attention (GQA without expanding K/V), repeat_kv reference
 │
 └── models/
     ├── mod.rs      CausalLM trait + ModelMeta (layers, q/kv heads, head_dim, ctx, params)
@@ -146,6 +157,34 @@ sets `-C link-self-contained=no` for that target, which hands CRT + winpthreads
 resolution to the MSYS2 `gcc` driver (whose `libwinpthread` has the symbol).
 Keep MSYS2 `mingw-w64-x86_64-toolchain` on `PATH`. See the comments in that file
 for the MSVC `link.exe`-shadowing case.
+
+### Hardware
+
+`.cargo/config.toml` builds with `-C target-cpu=native`, so a local build uses
+every SIMD extension the build machine has. This matters more than it sounds:
+candle compiles its AVX2/F16C kernels (f16 and bf16 dot products, the quantized
+matmuls) only when the target enables them, and a default x86-64 build leaves
+them out. fp32 matmul is unaffected either way, because the `gemm` crate picks
+its SIMD at run time.
+
+The flip side is that the binary only runs on CPUs with the same features. To
+build one for distribution, set `RUSTFLAGS` (which replaces the config file's
+flags), e.g. `RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release`.
+
+Everything else is decided at run time by `ExecutionPlan`, printed at startup:
+
+```text
+plan   : device=cpu threads=6 (6C/12T) cpu_simd=built:avx2+fma+f16c available:avx2+fma+f16c half=f16 argmax=host
+```
+
+| choice | CPU | CUDA |
+|---|---|---|
+| threads | physical cores (decode is bandwidth-bound; SMT siblings add little). Override with `RAYON_NUM_THREADS` or `sweep --threads` | — |
+| weight precision | checkpoint dtype if the device runs it (probed), else fp32 | bf16 on Ampere+, fp32 fallback |
+| greedy argmax | on the host | on the device; only the token id is copied back |
+
+If the CPU supports more than the binary was built for, the plan prints a
+warning saying so.
 
 ## Usage
 
@@ -281,7 +320,10 @@ Measured on a Ryzen 5 5600G, CPU, fp32, `openai-community/gpt2` (124M):
 | parity vs HF Transformers (24 prompts), forward | mean cos `1.00000`, top-1 `24/24`, mean MSE `1.8e-9` |
 | parity vs HF Transformers (24 prompts), KV-cache path | mean cos `1.00000`, top-1 `24/24`, mean MSE `2.2e-9` |
 
-Numbers come from real runs, not estimates.
+Numbers come from real runs, not estimates. They predate the execution plan,
+preallocated cache and grouped attention, which together made cached decode
+1.5–1.9× faster on the same CPU (measured under WSL2, so not directly comparable
+with the table above); see [benchmarks §9](benchmarks/README.md#9-execution-plan-preallocated-cache-grouped-attention).
 
 ## Tests
 
@@ -323,7 +365,10 @@ push and PR.
   WikiText-2 would either confirm it or show it up as an artifact.
 - Pre-RoPE and/or per-channel key quantization — the known fix for the drift
   that section 8 of the benchmarks measures
-- Preallocated cache buffer (remove the per-step `Tensor::cat` copy)
+- ~~Preallocated cache buffer~~ — done for full-precision storage (quantized modes still `cat`)
+- ~~Hardware-aware execution plan~~ — done (dtype probe, threads, device-side argmax)
+- **CPU mixed precision** — f16 weight storage with fp32 activations for bf16
+  checkpoints: half the memory and bandwidth of the current fp32 fallback
 - Low-precision attention matmul (turn the memory saving into a peak-RSS + speed win)
 - Verify and benchmark `gpt2-medium/large/xl`, `Qwen3-1.7B/4B/8B`
 - Batched generation

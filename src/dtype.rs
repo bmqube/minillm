@@ -73,13 +73,11 @@ impl Precision {
     ///
     /// candle's CPU gemm has no bf16 kernel — a bf16 model loads fine and then
     /// fails on the first attention matmul with "unsupported dtype BF16 for op
-    /// matmul", after the weights are already resident. CUDA does bf16 through
-    /// cuBLAS, so the same checkpoint is fine on a GPU.
+    /// matmul", after the weights are already resident. CUDA does bf16 on
+    /// Ampere and newer; older GPUs lack the kernels. Rather than encode either
+    /// rule, this runs a tiny probe on `device` (see [`crate::hardware::supports`]).
     pub fn is_supported_on(self, device: &Device) -> bool {
-        match self {
-            Self::F32 | Self::F16 => true,
-            Self::BF16 => !device.is_cpu(),
-        }
+        crate::hardware::supports(device, self.dtype())
     }
 
     /// This precision if `device` supports it, otherwise the widest one that

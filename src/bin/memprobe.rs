@@ -16,7 +16,7 @@
 
 use minillm::generation::{greedy, greedy_no_cache};
 use minillm::kv_cache::KvQuant;
-use minillm::{device, loader};
+use minillm::{loader, ExecutionPlan};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
@@ -30,7 +30,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let kv_quant = KvQuant::parse(&kvq_arg)
         .unwrap_or_else(|| panic!("KVQUANT expects none|int8|int4, got {kvq_arg:?}"));
 
-    let dev = device::best();
+    let plan = ExecutionPlan::detect();
+    plan.log();
+    let dev = plan.device().clone();
     let (model, _tok) = loader::load(&model_id, &dev)?;
     let model = model.as_ref();
     let ids: Vec<u32> = (0..prefill as u32).collect();

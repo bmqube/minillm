@@ -15,6 +15,8 @@
 //! | [`loader`] | Config parsing, architecture dispatch, sharded safetensors |
 //! | [`dtype`] | Compute [`Precision`] selection |
 //! | [`device`] | CPU / CUDA selection |
+//! | [`hardware`] | CPU SIMD features (built vs. available), core counts, half-precision probes |
+//! | [`plan`] | [`ExecutionPlan`]: the hardware-dependent choices for a run |
 //!
 //! Everything above [`models`] is architecture-agnostic: it talks to
 //! [`CausalLM`] and [`ModelMeta`], never to a concrete model type.
@@ -47,11 +49,14 @@
 pub mod device;
 pub mod dtype;
 pub mod generation;
+pub mod hardware;
 pub mod kv_cache;
 pub mod layers;
 pub mod loader;
 pub mod models;
+pub mod plan;
 
 pub use dtype::Precision;
 pub use kv_cache::{KvCache, KvQuant};
 pub use models::{CausalLM, ModelMeta};
+pub use plan::ExecutionPlan;

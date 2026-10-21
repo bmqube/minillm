@@ -18,7 +18,7 @@
 
 use candle_core::{IndexOp, Tensor};
 use minillm::generation::{greedy_no_cache, Generator, GREEDY};
-use minillm::{device, loader};
+use minillm::{loader, ExecutionPlan};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -29,8 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prefill: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(64);
     let decode: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(128);
 
-    let dev = device::best();
-    println!("device         : {dev:?}");
+    let plan = ExecutionPlan::detect();
+    let dev = plan.device().clone();
+    println!("plan           : {}", plan.summary());
+    for w in plan.hardware.warnings() {
+        println!("warning        : {w}");
+    }
     println!("model          : {model_id}");
     println!("prefill tokens : {prefill}");
     println!("decode steps   : {decode}");

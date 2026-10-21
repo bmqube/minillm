@@ -27,7 +27,7 @@ use std::path::Path;
 use candle_core::{IndexOp, Tensor};
 use minillm::generation::Generator;
 use minillm::models::CausalLM;
-use minillm::{device, loader};
+use minillm::{loader, ExecutionPlan};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -76,9 +76,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         _ => model.clone(),
     };
 
-    let dev = device::best();
+    let plan = ExecutionPlan::detect();
+    plan.log();
+    let dev = plan.device().clone();
     eprintln!(
-        "device: {dev:?}  model: {model}  ref: {model_ref}  path: {}",
+        "model: {model}  ref: {model_ref}  path: {}",
         if use_cache { "KV cache" } else { "forward" }
     );
     let (net, tokenizer) = loader::load(&model, &dev)?;

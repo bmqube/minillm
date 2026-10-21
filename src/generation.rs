@@ -58,13 +58,13 @@ pub fn sample_with<R: Rng + ?Sized>(
     cfg: &SamplingConfig,
     rng: &mut R,
 ) -> Result<u32> {
-    let mut logits = last_step_logits(logits)?;
     let greedy = cfg.temperature <= 1e-6;
 
-    // Fast path: pure argmax.
+    // Fast path: pure argmax, on the logits' own device.
     if greedy && cfg.top_k.is_none() && cfg.top_p.is_none() {
-        return Ok(argmax(&logits) as u32);
+        return greedy_id(logits);
     }
+    let mut logits = last_step_logits(logits)?;
 
     // Temperature.
     if !greedy && (cfg.temperature - 1.0).abs() > f64::EPSILON {
@@ -152,22 +152,42 @@ pub fn generate_token(
     )
 }
 
-/// Copy the logits for the final position into a `Vec<f32>`.
-fn last_step_logits(logits: &Tensor) -> Result<Vec<f32>> {
-    let row = match logits.dims().len() {
-        1 => logits.clone(),
-        2 => logits.i(0)?,
+/// The final position's logits row (batch index 0), still on its device.
+fn last_step_row(logits: &Tensor) -> Result<Tensor> {
+    match logits.dims().len() {
+        1 => Ok(logits.clone()),
+        2 => logits.i(0),
         3 => {
             let seq_len = logits.dims()[1];
-            logits.i((0, seq_len - 1))?
+            logits.i((0, seq_len - 1))
         }
-        n => {
-            return Err(candle_core::Error::Msg(format!(
-                "sample: expected logits of rank 1-3, got rank {n}"
-            )))
-        }
-    };
-    row.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()
+        n => Err(candle_core::Error::Msg(format!(
+            "sample: expected logits of rank 1-3, got rank {n}"
+        ))),
+    }
+}
+
+/// Copy the logits for the final position into a `Vec<f32>`.
+fn last_step_logits(logits: &Tensor) -> Result<Vec<f32>> {
+    last_step_row(logits)?
+        .to_dtype(candle_core::DType::F32)?
+        .to_vec1::<f32>()
+}
+
+/// Argmax of the final position's logits.
+///
+/// On a GPU the reduction runs there and only the 4-byte id crosses back to the
+/// host — instead of the whole vocabulary row (Qwen3's 151,936 logits are
+/// ~300 KB at bf16). On the CPU the row is scanned directly. Exact ties between maximal
+/// logits are vanishingly rare, but are not guaranteed to break the same way on
+/// both paths.
+fn greedy_id(logits: &Tensor) -> Result<u32> {
+    let row = last_step_row(logits)?;
+    if row.device().is_cpu() {
+        Ok(argmax(&last_step_logits(&row)?) as u32)
+    } else {
+        row.argmax(0)?.to_scalar::<u32>()
+    }
 }
 
 fn normalize(v: &mut [f32]) {
@@ -351,12 +371,7 @@ pub fn greedy_no_cache(model: &dyn CausalLM, prompt: &[u32], steps: usize) -> Re
     let mut out = Vec::with_capacity(steps);
     for _ in 0..steps {
         let input = Tensor::from_vec(seq.clone(), (1, seq.len()), &device)?;
-        let row: Vec<f32> = model
-            .forward_last(&input)?
-            .i(0)?
-            .to_dtype(candle_core::DType::F32)?
-            .to_vec1::<f32>()?;
-        let next = argmax(&row) as u32;
+        let next = greedy_id(&model.forward_last(&input)?)?;
         seq.push(next);
         out.push(next);
     }

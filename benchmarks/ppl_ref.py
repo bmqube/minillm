@@ -28,7 +28,10 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(model_dir).eval()
+    # fp32 regardless of the checkpoint's dtype, as parity.py does: `ppl` is
+    # compared at fp32, and Transformers v5 would otherwise load bf16 weights
+    # as bf16.
+    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32).eval()
 
     with open(text_file, encoding="utf-8") as fh:
         text = fh.read()

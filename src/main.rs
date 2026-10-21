@@ -8,7 +8,7 @@
 //! Arguments: `[MODEL] [PROMPT]`. `MODEL` is a Hub id or a local directory;
 //! precision follows the checkpoint's own `torch_dtype`.
 
-use minillm::generation::{Generator, SamplingConfig, TextStream};
+use minillm::generation::{Generator, SamplingConfig};
 use minillm::{loader, ExecutionPlan};
 use std::io::Write;
 use std::time::Instant;
@@ -61,17 +61,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     generator.prefill(&ids)?;
 
     let start = Instant::now();
-    let mut text = TextStream::new(&tokenizer);
+    // Byte-level BPE can split one character across tokens; the stream holds
+    // the pieces back until it is whole.
+    let mut text = tokenizer.decode_stream(false);
+    let mut generated = 0usize;
     for _ in 0..max_new_tokens {
         let next = generator.next_token(&cfg)?;
         if stops.contains(&next) {
             break;
         }
-        print!("{}", text.push(next)?);
-        std::io::stdout().flush()?;
+        generated += 1;
+        if let Some(piece) = text.step(next)? {
+            print!("{piece}");
+            std::io::stdout().flush()?;
+        }
     }
     println!();
-    let generated = text.ids().len();
 
     let secs = start.elapsed().as_secs_f64();
     if generated > 0 {

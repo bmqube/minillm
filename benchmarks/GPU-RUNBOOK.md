@@ -14,7 +14,7 @@ CUDA GPU works, the only thing that changes is which models fit.
 |---|---|
 | NVIDIA driver | 570+ for Blackwell (`nvidia-smi` should print the card) |
 | CUDA toolkit | 12.8 or newer for `sm_120`; **12.0–12.6 will not compile for a 5090** |
-| Rust | 1.89+ |
+| Rust | 1.91+ |
 | C toolchain | Linux: system gcc. Windows: MSVC build tools, or MSYS2 mingw-w64 (see the root README) |
 
 Check the toolkit is visible:
@@ -165,32 +165,34 @@ timing number below is worth recording.**
 python -m pip install numpy torch transformers        # once
 
 # GPT-2, both paths
-./target/release/parity_dump --                      benchmarks/prompts.txt benchmarks/gpt2_logits.json  benchmarks/gpt2
+./target/release/parity_dump                         benchmarks/prompts.txt benchmarks/gpt2_logits.json  benchmarks/gpt2
 python benchmarks/parity.py benchmarks/gpt2_logits.json
 ./target/release/parity_dump --cache                 benchmarks/prompts.txt benchmarks/gpt2_logits.json  benchmarks/gpt2
 python benchmarks/parity.py benchmarks/gpt2_logits.json
 
-# Qwen3, both paths
-./target/release/parity_dump --                      benchmarks/prompts.txt benchmarks/qwen3_logits.json benchmarks/qwen3-0.6b
+# Qwen3, both paths, pinned to fp32 (it would otherwise load at its bf16)
+./target/release/parity_dump --precision f32         benchmarks/prompts.txt benchmarks/qwen3_logits.json benchmarks/qwen3-0.6b
 python benchmarks/parity.py benchmarks/qwen3_logits.json
-./target/release/parity_dump --cache                 benchmarks/prompts.txt benchmarks/qwen3_logits.json benchmarks/qwen3-0.6b
+./target/release/parity_dump --cache --precision f32 benchmarks/prompts.txt benchmarks/qwen3_logits.json benchmarks/qwen3-0.6b
 python benchmarks/parity.py benchmarks/qwen3_logits.json
 ```
 
 Pass criteria: `mean cos > 0.9999`, `top1 = 24/24`, `mean mse < 1e-3`.
 
 > At **bf16** these thresholds do not apply — bf16 has ~3 decimal digits, so
-> expect `mse ~1e-2` and occasional top-1 disagreement on near-ties. Run the
-> parity gate at `--precision f32` on the GPU, then report bf16 quality through
+> expect `mse ~1e-2` and occasional top-1 disagreement on near-ties. That is why
+> the gate above pins `--precision f32`; report bf16 quality through
 > perplexity (§4.4) instead, which is the metric that survives low precision.
 
 ### 4.2 Cache correctness (gate)
 
 ```bash
-cargo test --release --features cuda --test cache_parity -- --ignored --nocapture
+MINILLM_PRECISION=f32 cargo test --release --features cuda --test cache_parity -- --ignored --nocapture
 ```
 
-All 13 must pass (each architecture's cases skip if its weights are absent).
+`MINILLM_PRECISION=f32` pins the weights to fp32, as on the CPU; at bf16, cuBLAS
+may round decode-shaped and prefill-shaped matmuls differently enough to flip a
+near-tie. All 13 must pass (each architecture's cases skip if its weights are absent).
 `cache_matches_no_cache` is the important one: greedy decode
 with the cache must produce byte-identical token ids to full recompute.
 

@@ -43,7 +43,7 @@
 //! against this same fp32 baseline at a fixed `MAX_TOKENS`.
 
 use candle_core::{DType, IndexOp, Tensor};
-use minillm::kv_cache::{KvCache, KvQuant};
+use minillm::kv_cache::KvQuant;
 use minillm::{loader, ExecutionPlan};
 use std::time::Instant;
 
@@ -138,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Fresh cache per window; a single prefill call quantizes every
                 // position's K/V, so the logits reflect the int8-round-tripped
                 // cache exactly as a decode loop would.
-                let mut cache = KvCache::with_quant(model.meta().n_layer, q);
+                let mut cache = model.new_cache_with(q);
                 model.forward_with_cache(&input, &mut cache)?
             }
         };

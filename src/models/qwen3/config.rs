@@ -104,6 +104,7 @@ impl Qwen3Config {
         ModelMeta {
             architecture: "qwen3",
             n_layer: self.num_hidden_layers,
+            n_kv_layers: self.num_hidden_layers,
             n_head: self.num_attention_heads,
             n_kv_head: self.num_key_value_heads,
             head_dim: self.head_dim,

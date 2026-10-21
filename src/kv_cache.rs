@@ -436,30 +436,141 @@ fn dequantize_i4(packed: &Tensor, scale: &Tensor, zero: &Tensor, dtype: DType) -
         .contiguous()
 }
 
-/// The whole model's cache: one [`LayerKvCache`] per transformer block.
+/// Decode state for a layer that keeps no KV cache.
+///
+/// Linear-attention and state-space layers (Qwen3.5's Gated DeltaNet, Mamba)
+/// summarise the whole history in a **fixed-size** recurrent state, plus the
+/// last few inputs of a short causal convolution. Neither grows with sequence
+/// length. The container is deliberately dumb: the layer that owns it decides
+/// the shapes and what they mean; this only holds them between calls and
+/// counts how many positions they summarise.
+#[derive(Debug, Default)]
+pub struct RecurrentCache {
+    conv: Option<Tensor>,
+    state: Option<Tensor>,
+    seen: usize,
+}
+
+impl RecurrentCache {
+    /// An empty state; the owning layer starts from zeros.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of positions the state summarises.
+    pub fn len(&self) -> usize {
+        self.seen
+    }
+
+    /// Whether nothing has been processed yet.
+    pub fn is_empty(&self) -> bool {
+        self.seen == 0
+    }
+
+    /// The convolution's trailing inputs, if any have been stored.
+    pub fn conv_state(&self) -> Option<&Tensor> {
+        self.conv.as_ref()
+    }
+
+    /// The recurrent state, if any has been stored.
+    pub fn recurrent_state(&self) -> Option<&Tensor> {
+        self.state.as_ref()
+    }
+
+    /// Replace both states after the layer has consumed `n_new` more positions.
+    pub fn update(&mut self, conv: Tensor, state: Tensor, n_new: usize) {
+        self.conv = Some(conv);
+        self.state = Some(state);
+        self.seen += n_new;
+    }
+
+    /// Drop both states; [`len`](Self::len) returns to 0.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Bytes currently held. Constant once the first call has run.
+    pub fn bytes(&self) -> usize {
+        [&self.conv, &self.state]
+            .iter()
+            .filter_map(|t| t.as_ref())
+            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .sum()
+    }
+}
+
+/// What a transformer layer keeps between decode steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Softmax attention: a [`LayerKvCache`] that grows with the sequence.
+    Attention,
+    /// Linear attention / state space: a fixed-size [`RecurrentCache`].
+    Recurrent,
+}
+
+#[derive(Debug)]
+enum LayerCache {
+    Attention(LayerKvCache),
+    Recurrent(RecurrentCache),
+}
+
+impl LayerCache {
+    fn len(&self) -> usize {
+        match self {
+            Self::Attention(c) => c.len(),
+            Self::Recurrent(c) => c.len(),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Attention(c) => c.reset(),
+            Self::Recurrent(c) => c.reset(),
+        }
+    }
+}
+
+/// The whole model's decode state: one entry per transformer block, either a
+/// [`LayerKvCache`] or, for hybrid architectures, a [`RecurrentCache`].
+///
+/// [`KvCache::new`] and [`KvCache::with_quant`] build the all-attention layout
+/// GPT-2 and Qwen3 use; [`KvCache::with_layout`] builds a mixed one. Models
+/// hand out the right one through
+/// [`CausalLM::new_cache_with`](crate::models::CausalLM::new_cache_with).
 #[derive(Debug)]
 pub struct KvCache {
-    layers: Vec<LayerKvCache>,
+    layers: Vec<LayerCache>,
     quant: KvQuant,
 }
 
 impl KvCache {
-    /// A cache for a model with `n_layer` transformer blocks, full precision.
+    /// A cache for a model with `n_layer` attention blocks, full precision.
     pub fn new(n_layer: usize) -> Self {
         Self::with_quant(n_layer, KvQuant::None)
     }
 
-    /// A cache whose every layer quantizes stored K/V with `quant`.
+    /// A cache whose every layer is attention and quantizes stored K/V with
+    /// `quant`.
     pub fn with_quant(n_layer: usize, quant: KvQuant) -> Self {
+        Self::with_layout(&vec![LayerKind::Attention; n_layer], quant)
+    }
+
+    /// A cache with one entry per element of `kinds`. `quant` applies to the
+    /// attention layers; recurrent state is stored as the layer produces it.
+    pub fn with_layout(kinds: &[LayerKind], quant: KvQuant) -> Self {
         Self {
-            layers: (0..n_layer)
-                .map(|_| LayerKvCache::with_quant(quant))
+            layers: kinds
+                .iter()
+                .map(|kind| match kind {
+                    LayerKind::Attention => LayerCache::Attention(LayerKvCache::with_quant(quant)),
+                    LayerKind::Recurrent => LayerCache::Recurrent(RecurrentCache::new()),
+                })
                 .collect(),
             quant,
         }
     }
 
-    /// Quantization mode every layer was built with.
+    /// Quantization mode the attention layers were built with.
     pub fn quant(&self) -> KvQuant {
         self.quant
     }
@@ -469,9 +580,18 @@ impl KvCache {
         self.layers.len()
     }
 
-    /// Cached sequence length (layer 0 — every layer advances together).
+    /// What layer `i` keeps, or `None` past the last layer.
+    pub fn kind(&self, i: usize) -> Option<LayerKind> {
+        self.layers.get(i).map(|layer| match layer {
+            LayerCache::Attention(_) => LayerKind::Attention,
+            LayerCache::Recurrent(_) => LayerKind::Recurrent,
+        })
+    }
+
+    /// Positions processed so far (layer 0 — every layer advances together,
+    /// whichever kind it is).
     pub fn len(&self) -> usize {
-        self.layers.first().map(LayerKvCache::len).unwrap_or(0)
+        self.layers.first().map(LayerCache::len).unwrap_or(0)
     }
 
     /// Whether nothing has been cached yet.
@@ -486,17 +606,35 @@ impl KvCache {
         }
     }
 
-    /// Mutable handle to layer `i`'s cache.
+    /// Mutable handle to attention layer `i`'s KV cache.
     ///
     /// # Panics
-    /// If `i >= n_layer()`.
+    /// If `i >= n_layer()`, or layer `i` is [`LayerKind::Recurrent`].
     pub fn layer(&mut self, i: usize) -> &mut LayerKvCache {
-        &mut self.layers[i]
+        match &mut self.layers[i] {
+            LayerCache::Attention(c) => c,
+            LayerCache::Recurrent(_) => panic!("layer {i} is recurrent, not attention"),
+        }
     }
 
-    /// Non-panicking variant of [`layer`](Self::layer).
+    /// Non-panicking variant of [`layer`](Self::layer): `None` past the last
+    /// layer or for a recurrent layer.
     pub fn get(&mut self, i: usize) -> Option<&mut LayerKvCache> {
-        self.layers.get_mut(i)
+        match self.layers.get_mut(i)? {
+            LayerCache::Attention(c) => Some(c),
+            LayerCache::Recurrent(_) => None,
+        }
+    }
+
+    /// Mutable handle to recurrent layer `i`'s state.
+    ///
+    /// # Panics
+    /// If `i >= n_layer()`, or layer `i` is [`LayerKind::Attention`].
+    pub fn recurrent(&mut self, i: usize) -> &mut RecurrentCache {
+        match &mut self.layers[i] {
+            LayerCache::Recurrent(c) => c,
+            LayerCache::Attention(_) => panic!("layer {i} is attention, not recurrent"),
+        }
     }
 }
 
@@ -670,6 +808,50 @@ mod tests {
             KvQuant::Int8
         );
         assert_eq!(LayerKvCache::new().quant(), KvQuant::None);
+    }
+
+    #[test]
+    fn hybrid_layout_routes_each_layer_to_its_kind() {
+        use LayerKind::{Attention, Recurrent};
+        let mut cache = KvCache::with_layout(&[Recurrent, Recurrent, Attention], KvQuant::Int8);
+        assert_eq!(cache.n_layer(), 3);
+        assert_eq!(cache.kind(0), Some(Recurrent));
+        assert_eq!(cache.kind(2), Some(Attention));
+        assert_eq!(cache.kind(3), None);
+        assert!(cache.get(0).is_none(), "a recurrent layer has no KV cache");
+        assert_eq!(cache.layer(2).quant(), KvQuant::Int8);
+
+        // len() follows layer 0 even when it is recurrent.
+        for i in 0..2 {
+            let state = Tensor::zeros((1, 2, 4, 4), DType::F32, &Device::Cpu).unwrap();
+            cache.recurrent(i).update(kv(2, 0.0), state, 5);
+        }
+        cache.layer(2).append(&kv(5, 1.0), &kv(5, 1.0)).unwrap();
+        assert_eq!(cache.len(), 5);
+
+        cache.reset();
+        assert!(cache.is_empty());
+        assert!(cache.recurrent(1).recurrent_state().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "recurrent, not attention")]
+    fn layer_panics_on_a_recurrent_layer() {
+        KvCache::with_layout(&[LayerKind::Recurrent], KvQuant::None).layer(0);
+    }
+
+    #[test]
+    fn recurrent_state_counts_positions_and_bytes() {
+        let mut c = RecurrentCache::new();
+        assert!(c.is_empty());
+        assert_eq!(c.bytes(), 0);
+        let conv = Tensor::zeros((1, 8, 3), DType::F32, &Device::Cpu).unwrap();
+        let state = Tensor::zeros((1, 2, 4, 4), DType::F32, &Device::Cpu).unwrap();
+        c.update(conv.clone(), state.clone(), 7);
+        c.update(conv, state, 1);
+        assert_eq!(c.len(), 8);
+        // Fixed size: 8*3 + 2*4*4 fp32 values, however many positions.
+        assert_eq!(c.bytes(), (24 + 32) * 4);
     }
 
     #[test]

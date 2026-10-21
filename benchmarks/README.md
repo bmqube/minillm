@@ -27,14 +27,22 @@ mkdir -p benchmarks/qwen3-0.6b && cd benchmarks/qwen3-0.6b
 base=https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main
 for f in config.json tokenizer.json model.safetensors; do curl -sL -o "$f" "$base/$f"; done
 cd ../..
+
+# Qwen3.5 ships one shard plus an index (and tokenizer_config.json, which
+# the HF reference in §2 needs to build its tokenizer).
+mkdir -p benchmarks/qwen3.5-0.8b && cd benchmarks/qwen3.5-0.8b
+base=https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main
+for f in config.json tokenizer.json tokenizer_config.json model.safetensors.index.json \
+         model.safetensors-00001-of-00001.safetensors; do curl -sL -o "$f" "$base/$f"; done
+cd ../..
 ```
 
 Running any of this on a GPU: see [`GPU-RUNBOOK.md`](GPU-RUNBOOK.md).
 
 > **Precision.** GPT-2 publishes fp32 weights and Qwen3 publishes bf16, and the
 > loader follows the checkpoint unless told otherwise. candle has no CPU bf16
-> gemm, so **every CPU number below is fp32** — Qwen3 included, loaded at 2x its
-> published size with a note on stderr. On CUDA, Qwen3 stays bf16. Pin with
+> gemm, so **every CPU number below is fp32** — Qwen3 and Qwen3.5 included,
+> loaded at 2x their published size with a note on stderr. On CUDA they stay bf16. Pin with
 > `--precision` when comparing across devices.
 
 The binaries also accept a Hub id (`openai-community/gpt2`) instead of the
@@ -52,6 +60,16 @@ sha256sum benchmarks/gpt2/*            # or: shasum -a 256 / Get-FileHash -Algor
 | `tokenizer.json` | `8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6` |
 | `model.safetensors` | `248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707` |
 | `wikitext2.txt` (§5) | `bbf94c53a05abe9ee670d3b6343608095822c85e26de37c70b24fc571964574a` |
+
+Qwen3.5-0.8B (`sha256sum benchmarks/qwen3.5-0.8b/*`):
+
+| file | SHA-256 |
+|---|---|
+| `config.json` | `b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204` |
+| `tokenizer.json` | `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42` |
+| `tokenizer_config.json` | `49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c` |
+| `model.safetensors.index.json` | `d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e` |
+| `model.safetensors-00001-of-00001.safetensors` | `04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696` |
 
 ## 1. Throughput and size
 
@@ -150,14 +168,37 @@ full-recompute forward pass and the KV-cache decode path. Qwen3's residuals are
 about an order of magnitude tighter than GPT-2's, consistent with RMSNorm and
 QK-norm keeping activations in a narrower range than GPT-2's LayerNorm.
 
-`tests/cache_parity.rs` adds four checks per architecture, run with
-`cargo test --test cache_parity -- --ignored`:
+**Qwen3.5-0.8B.** Reference: transformers 5.20.2 (the first 5.x line with
+`qwen3_5`), torch 2.14.1+cpu, under WSL2; same 24 prompts, fp32 both sides.
+
+| aggregate | qwen3.5 `forward` | qwen3.5 `--cache` |
+|---|---|---|
+| mean mse | **2.188e-11** | **1.905e-11** |
+| mean cosine similarity | **1.00000** | **1.00000** |
+| mean KL(hf‖mini) | 7.627e-12 | 8.220e-12 |
+| top-1 agreement | **24 / 24** | **24 / 24** |
+| top-5 overlap | **120 / 120** | **120 / 120** |
+
+This holds although the two sides compute the DeltaNet layers differently:
+the reference prefills with the chunked gated-delta-rule, MiniLLM runs the
+recurrence token by token. The two are equal in exact arithmetic and agree here
+to fp32 noise.
+
+`tests/cache_parity.rs` adds four checks per architecture, plus a fifth for
+hybrid models, run with
+`cargo test --release --test cache_parity -- --ignored --test-threads=1` (one
+model in memory at a time):
 
 | test | what it catches |
 |---|---|
 | `cache_matches_no_cache` | cached greedy decode must emit byte-identical ids to full recompute |
 | `incremental_prefill_matches_bulk` | feeding the prompt one token at a time must match one bulk prefill — this is what a wrong RoPE offset breaks, and a full-sequence-only test cannot see it |
 | `cache_stores_kv_heads_not_query_heads` | the cached key tensor must be `[batch, n_kv_head, seq, head_dim]`; caching the `repeat_kv`-expanded copy still yields correct logits, so only a shape assertion finds it |
+| `recurrent_state_is_constant_size` (Qwen3.5) | the DeltaNet state must hold the same bytes after 32 more tokens as after the prompt |
+
+For Qwen3.5 the full-recompute reference rebuilds the recurrent state from
+scratch every step, so `cache_matches_no_cache` checks that a state carried
+across 32 steps lands on exactly the same tokens.
 | `quantized_caches_stay_close` | int8/int4 drift, scaled by the logit standard deviation |
 
 ## 3. Larger GPT-2 variants (optional)
@@ -474,10 +515,23 @@ architecture that"`, scaled by the standard deviation of the reference logits
 |---|---|---|---|---|
 | gpt2 124M | 4.177 | **0.038 σ** | 0.228 σ | preserved |
 | Qwen3 0.6B | 2.597 | **0.268 σ** | **3.525 σ** | **changed** (646 → 374) |
+| Qwen3.5 0.8B (WSL2) | 2.621 | **0.054 σ** | 0.611 σ | preserved (5533) |
 
 Qwen3 is **~7× more sensitive to int8** and **~15× more to int4**. On this
 prompt int8 flips its top-1 token (646 → 374) while GPT-2's is untouched, and
 int4's 3.7 σ drift means the cache is no longer approximating the model.
+
+**Qwen3.5 sits much closer to GPT-2** than to Qwen3: int8 drift is 5× smaller
+than Qwen3's and preserves the top-1 token. It differs from Qwen3 in two ways
+that bear on the explanation below. It rotates only the first 64 of each head's
+256 channels, so three quarters of every cached key keeps its trained channel
+structure. And only 6 of its 24 layers cache K/V at all, so there are fewer
+quantized caches for error to enter through. The first is what the RoPE
+hypothesis below would predict. Its `head_dim` is 256, *wider* than Qwen3's
+128, which on its own the second hypothesis below says should make it worse;
+it does not, so `head_dim` is at most a secondary factor. One prompt, one model
+of each family, measured under WSL2: an observation to test with perplexity,
+not a result.
 
 Reproduce with:
 
@@ -577,3 +631,38 @@ Qwen3 int4 drift of 4.007 σ (int8 0.266 σ) on unmodified `main` and on this
 build alike, against the 3.525 σ (int8 0.268 σ) in §8, which was measured on
 Windows. The int8 figure and every top-1 outcome agree; the int4 gap is a
 platform difference, not a regression.
+
+## 10. Qwen3.5: a hybrid model on the CPU
+
+Qwen3.5-0.8B against Qwen3-0.6B, same session, WSL2 on the Ryzen 5 5600G, fp32,
+64 greedy decode steps, KV cache on, mean of 2 trials.
+
+```bash
+sweep benchmarks/qwen3-0.6b,benchmarks/qwen3.5-0.8b 64,512,960 64 on none --repeats 2
+```
+
+| model | params (text) | KV B/token | prefill | prefill tok/s | decode tok/s |
+|---|---|---|---|---|---|
+| Qwen3 0.6B | 596.0M | 229,376 | 64 | 140.8 | 10.22 ± 0.01 |
+| Qwen3 0.6B | | | 512 | 217.9 | 8.81 ± 0.01 |
+| Qwen3 0.6B | | | 960 | 144.1 | 7.45 ± 0.51 |
+| Qwen3.5 0.8B | 752.4M | 24,576 | 64 | 103.3 | 7.85 ± 0.03 |
+| Qwen3.5 0.8B | | | 512 | 128.2 | 7.74 ± 0.02 |
+| Qwen3.5 0.8B | | | 960 | 107.8 | 7.20 ± 0.28 |
+
+- **Short-context decode tracks parameter count.** Qwen3.5 has 1.26× the
+  weights and decodes at 0.77× the rate, close to what a bandwidth-bound decode
+  predicts.
+- **It barely slows with context.** From 64 to 960 tokens Qwen3.5 loses 8% of its
+  decode rate, Qwen3 loses 27%: Qwen3.5's KV cache is 9.3× smaller per token (6
+  attention layers × 2 KV heads, against 28 × 8), and the other 18 layers carry a
+  fixed ~19 MB of state whatever the context. At 960 tokens the two are within
+  4%; the crossover lies beyond what was measured here.
+- **Prefill is 25–40% slower than Qwen3.** MiniLLM runs the DeltaNet recurrence
+  token by token for prefill too. The chunked formulation the reference uses is
+  the fix, and the main reason to expect the prefill gap to close.
+
+The 752.4M is the text model alone, from the config, and matches the sum of the
+checkpoint's `model.language_model.*` tensors exactly (pinned by a unit test).
+The checkpoint also carries a 100.6M vision tower and a 20.5M MTP head, neither
+loaded.
